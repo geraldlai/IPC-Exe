@@ -1,5 +1,13 @@
 Revision history for IPC::Exe
 
+1.002    2009/04/17
+         - Fixed barewords STDIN/STDOUT/STDERR while "strict subs".
+         - Extracted examples into new EXAMPLES section in pod.
+         - Included "META.yml" in dist.
+         - Extracted license info from "README" into its own file "LICENSE".
+         - Skip 'background' test in "02_IPC-Exe.t" if not in DEBUG mode.
+           Testing bg() requires manual inspection.
+
 1.001    2009/04/02
-         Initial revision.
+         - Initial revision.
 

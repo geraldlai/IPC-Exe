@@ -424,6 +424,7 @@ my $filt_err_out = [
 
 # background
 SKIP: {
+    skip("- Only available in DEBUG mode", 1) unless $DEBUG;
     skip("- Time::HiRes::ualarm() not supported", 1) unless $got_ualarm;
 
     # this is touchy - may fail sporadically depending on system load

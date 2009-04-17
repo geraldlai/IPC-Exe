@@ -1,0 +1,12 @@
+# http://module-build.sourceforge.net/META-spec.html
+#XXXXXXX This is a prototype!!!  It will change in the future!!! XXXXX#
+name:         IPC-Exe
+version:      1.002
+version_from: lib/IPC/Exe.pm
+installdirs:  site
+requires:
+    File::Spec:                    0
+    Time::HiRes:                   0
+
+distribution_type: module
+generated_by: ExtUtils::MakeMaker version 6.21

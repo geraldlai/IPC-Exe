@@ -27,11 +27,3 @@ This module requires these other modules and libraries:
     File::Spec
     Time::HiRes
 
-
-COPYRIGHT AND LICENCE
-
-Copyright (C) 2009 by Gerald Lai
-
-This module is free software; you may redistribute it and/or modify
-it under the same terms as Perl itself.
-

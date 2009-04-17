@@ -1,4 +1,5 @@
 Changes
+LICENSE
 Makefile.PL
 MANIFEST
 README
@@ -9,3 +10,4 @@ lib/IPC/Exe.pm
 t/00_pod.t
 t/01_pod-coverage.t
 t/02_IPC-Exe.t
+META.yml                                 Module meta-data (added by MakeMaker)
