@@ -1,5 +1,9 @@
 Revision history for IPC::Exe
 
+1.004    2009/04/20
+         - Fixed: found = in conditional, should be ==.
+           use warnings; doesn't understand what I mean.
+
 1.003    2009/04/20
          - Changed: exec() failure code sequence.
          - Fixed: unknown open() mode '<&' to be compatible with Perl 5.6+.

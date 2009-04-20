@@ -12,7 +12,7 @@ BEGIN {
     require Exporter;
     *import = \&Exporter::import; # just inherit import() only
 
-    our $VERSION   = 1.003;
+    our $VERSION   = 1.004;
     our @EXPORT_OK = qw(&exe &bg);
 }
 
@@ -405,9 +405,13 @@ EOT
             }
 
             # assume exit status 255 indicates failed exec
-            exec { $cmd[0] } @cmd
-                or $! = -1
-                and die("IPC::Exe::exe() failed to exec: @cmd\n");
+            {
+                no warnings qw(syntax);
+
+                exec { $cmd[0] } @cmd
+                    or ($! = -1)
+                    and die("IPC::Exe::exe() failed to exec: @cmd\n");
+            }
         }
     }
 }
