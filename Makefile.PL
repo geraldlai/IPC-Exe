@@ -9,6 +9,7 @@ WriteMakefile(
     NAME              => 'IPC::Exe',
     VERSION_FROM      => 'lib/IPC/Exe.pm',
     PREREQ_PM         => {
+                             'POSIX'       => 0,
                              'File::Spec'  => 0,
                              'Time::HiRes' => 0,
                          },

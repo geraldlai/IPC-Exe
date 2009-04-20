@@ -1,12 +1,16 @@
-# http://module-build.sourceforge.net/META-spec.html
-#XXXXXXX This is a prototype!!!  It will change in the future!!! XXXXX#
-name:         IPC-Exe
-version:      1.002
-version_from: lib/IPC/Exe.pm
-installdirs:  site
-requires:
+--- #YAML:1.0
+name:                IPC-Exe
+version:             1.003
+abstract:            Execute processes or Perl subroutines & string them via IPC. Think shell pipes.
+license:             ~
+author:              
+    - Gerald Lai
+generated_by:        ExtUtils::MakeMaker version 6.44
+distribution_type:   module
+requires:     
     File::Spec:                    0
+    POSIX:                         0
     Time::HiRes:                   0
-
-distribution_type: module
-generated_by: ExtUtils::MakeMaker version 6.21
+meta-spec:
+    url:     http://module-build.sourceforge.net/META-spec-v1.3.html
+    version: 1.3

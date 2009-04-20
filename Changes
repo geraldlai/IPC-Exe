@@ -1,7 +1,13 @@
 Revision history for IPC::Exe
 
+1.003    2009/04/20
+         - Changed: exec() failure code sequence.
+         - Fixed: unknown open() mode '<&' to be compatible with Perl 5.6+.
+         - Fixed: minor mistakes in pod.
+         - Added: PREREQ_PM for POSIX module.
+
 1.002    2009/04/17
-         - Fixed barewords STDIN/STDOUT/STDERR while "strict subs".
+         - Fixed: barewords STDIN/STDOUT/STDERR while "strict subs".
          - Extracted examples into new EXAMPLES section in pod.
          - Included "META.yml" in dist.
          - Extracted license info from "README" into its own file "LICENSE".

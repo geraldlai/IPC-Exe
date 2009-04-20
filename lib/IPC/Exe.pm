@@ -12,7 +12,7 @@ BEGIN {
     require Exporter;
     *import = \&Exporter::import; # just inherit import() only
 
-    our $VERSION   = 1.002;
+    our $VERSION   = 1.003;
     our @EXPORT_OK = qw(&exe &bg);
 }
 
@@ -117,7 +117,7 @@ sub _exe {
 
     # dup(2) stdin to be restored later
     my $ORIGSTDIN;
-    open($ORIGSTDIN, "<&", fileno(*STDIN))
+    open($ORIGSTDIN, "<&" . fileno(*STDIN))
         or warn("IPC::Exe::exe() cannot dup(2) STDIN\n  $!")
         and return ();
 
@@ -161,7 +161,7 @@ EOT
         # temporarily replace stdin
         $IPC::Exe::_stdin
             ? open(*STDIN, "<&=" . fileno($EXE_READ))
-            : open(*STDIN, "<&", $EXE_READ)
+            : open(*STDIN, "<&"  . fileno($EXE_READ))
                 or die("IPC::Exe::exe() cannot replace STDIN\n  $!");
 
         # create package-scope $IPC::Exe::PIPE
@@ -223,7 +223,7 @@ EOT
         }
 
         # restore stdin
-        open(*STDIN, "<&", $ORIGSTDIN)
+        open(*STDIN, "<&" . fileno($ORIGSTDIN))
             or die("IPC::Exe::exe() cannot restore STDIN\n  $!");
 
         # child PID is undef if exec failed
@@ -270,7 +270,7 @@ EOT
         # change STDIN if input filehandle was required
         if ($FOR_STDIN)
         {
-            open(*STDIN, "<&", $FOR_STDIN)
+            open(*STDIN, "<&" . fileno($FOR_STDIN))
                 or die("IPC::Exe::exe() cannot change STDIN\n  $!");
         }
 
@@ -404,11 +404,10 @@ EOT
                 close($EXE_GO);
             }
 
-            { exec { $cmd[0] } @cmd }
-
             # assume exit status 255 indicates failed exec
-            $! = -1;
-            die("IPC::Exe::exe() failed to exec: @cmd\n");
+            exec { $cmd[0] } @cmd
+                or $! = -1
+                and die("IPC::Exe::exe() failed to exec: @cmd\n");
         }
     }
 }
@@ -607,7 +606,7 @@ sub _pipe_from_fork ($$$) {
         # dup(2) stdin/stdout/stderr to be restored later
         my ($ORIGSTDIN, $ORIGSTDOUT, $ORIGSTDERR);
 
-        open($ORIGSTDIN, "<&", fileno(*STDIN))
+        open($ORIGSTDIN, "<&" . fileno(*STDIN))
             or warn("IPC::Exe cannot dup(2) STDIN\n  $!")
             and return undef;
 
@@ -645,7 +644,7 @@ sub _pipe_from_fork ($$$) {
                 usleep($wait * 1e6);
                 #print *STDERR "wait> $wait\n";
 
-                open(*STDIN, "<&", $ORIGSTDIN)
+                open(*STDIN, "<&" . fileno($ORIGSTDIN))
                     or die("IPC::Exe cannot restore STDIN\n  $!");
 
                 open(*STDOUT, ">&", $ORIGSTDOUT)
@@ -708,7 +707,7 @@ except that C<[perlsub]> is really a perl child process with access to main prog
 
 =head1 DESCRIPTION
 
-This module was written to provide a secure and highly flexible way to execute external programs with an intuitive syntax. In addition, more info is returned with each string of executions, such as the list of PIDs and C<$?> of the last external pipe process (see L</RETURN VALUES>). Execution uses L<exec> command, and the shell is B<never> invoked (with exception for non-Unix platforms to allow use of L<system>).
+This module was written to provide a secure and highly flexible way to execute external programs with an intuitive syntax. In addition, more info is returned with each string of executions, such as the list of PIDs and C<$?> of the last external pipe process (see L</RETURN VALUES>). Execution uses C<exec> command, and the shell is B<never> invoked (with exception for non-Unix platforms to allow use of C<system>).
 
 The two exported subroutines perform all the heavy lifting of forking and executing processes. In particular, C<exe( )> implements the C<KID_TO_READ> version of
 
@@ -951,7 +950,7 @@ C<LIST> is C<exec( )> in the child process after the parent is forked, where the
 
 C<&PREEXEC> is called right before C<exec( )> in the child process, so we may reopen filehandles or do some child-only operations beforehand.
 
-Optionally, C<&PREEXEC> could return a LIST of strings to perform common filehandle redirections and/or L<binmode> settings. The following are preset actions:
+Optionally, C<&PREEXEC> could return a LIST of strings to perform common filehandle redirections and/or C<binmode> settings. The following are preset actions:
 
   "2>#"  or "2>null"   silence  stderr
    ">#"  or "1>null"   silence  stdout
@@ -1056,17 +1055,17 @@ Disable autoflush on the B<WRITEHANDLE> to C<STDIN> of the child process. This o
 
 =item binmode_io => ":raw", ":crlf", ":bytes", ":encoding(utf8)", etc.
 
-Set L<binmode> of C<STDIN> and C<STDOUT> of the child process for layer C<$EXE_OPTIONS{binmode_io}>. This is automatically done for subsequently chained C<exe( )>cutions. To stop this, set to an empty string C<""> or another layer to bring a different mode into effect.
+Set C<binmode> of C<STDIN> and C<STDOUT> of the child process for layer C<$EXE_OPTIONS{binmode_io}>. This is automatically done for subsequently chained C<exe( )>cutions. To stop this, set to an empty string C<""> or another layer to bring a different mode into effect.
 
 =item exec => 1
 
 B<NOTE:> This only applies to non-Unix platforms.
 
-Use L<exec> instead of L<system> when executing programs. This is set automatically when C<$EXE_OPTIONS{stdin}> is or was true in a previous C<exe( )>.
+Use C<exec> instead of C<system> when executing programs. This is set automatically when C<$EXE_OPTIONS{stdin}> is or was true in a previous C<exe( )>.
 
-With L<exec>, parent thread does not wait for child to finish, allowing programs that wait for STDIN to not block. This is useful to achieve L<IPC::Open3> behavior where programs wait expecting for further input.
+With C<exec>, parent thread does not wait for child to finish, allowing programs that wait for STDIN to not block. This is useful to achieve L<IPC::Open3> behavior where programs wait expecting for further input.
 
-With (default) L<system>, parent thread waits for child to finish and collects the exit status. If the child fails program execution, the parent will cease to continue and return an empty list. This is the way to detect breaks in the chain of C<exe( )>cutions.
+With (default) C<system>, parent thread waits for child to finish and collects the exit status. If the child fails program execution, the parent will cease to continue and return an empty list. This is the way to detect breaks in the chain of C<exe( )>cutions.
 
 =back
 
@@ -1136,7 +1135,7 @@ Calling the CODE reference returned by C<bg( )> B<returns> the PID of the backgr
 
 =head1 ERROR CHECKING
 
-To determine if either C<exe( )> or <bg( )> was successful until the point of forking, check whether the returned C<$PID> is defined.
+To determine if either C<exe( )> or C<bg( )> was successful until the point of forking, check whether the returned C<$PID> is defined.
 
 See L</EXAMPLES> for examples on error checking.
 
@@ -1144,7 +1143,7 @@ B<WARNING:> This may get a slightly complicated for chained C<exe( )>'s when non
 
 A minimum count of items (PIDs and/or filehandles) can be expected in the returned LIST to determine whether forks were initiated for the entire C<exe( )> / C<bg( )> chain.
 
-Failures after forking are responded with C<die( )>. To handle these errors, use L<eval>.
+Failures after forking are responded with C<die( )>. To handle these errors, use C<eval>.
 
 
 =head1 SYNTAX
