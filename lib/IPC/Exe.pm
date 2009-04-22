@@ -12,7 +12,7 @@ BEGIN {
     require Exporter;
     *import = \&Exporter::import; # just inherit import() only
 
-    our $VERSION   = 1.004;
+    our $VERSION   = 1.005;
     our @EXPORT_OK = qw(&exe &bg);
 }
 
@@ -277,7 +277,7 @@ EOT
         # collect STDERR if error filehandle was required
         if ($BY_STDERR)
         {
-            open(*STDERR, ">&", $BY_STDERR)
+            open(*STDERR, ">&" . fileno($BY_STDERR))
                 or die("IPC::Exe::exe() cannot collect STDERR\n  $!");
         }
 
@@ -332,13 +332,13 @@ IPC::Exe::exe() cannot silence STDOUT (does $DEVNULL exist?)
 EOT
 
             # redirect stderr to stdout
-            /^\s*2>&\s*1\s*$/          and open(*STDERR, ">&", *STDOUT)
+            /^\s*2>&\s*1\s*$/          and open(*STDERR, ">&" . fileno(*STDOUT))
             || die(<<"EOT" . "  $!");
 IPC::Exe::exe() cannot redirect STDERR to STDOUT
 EOT
 
             # redirect stdout to stderr
-            /^\s*1?>&\s*2\s*$/         and open(*STDOUT, ">&", *STDERR)
+            /^\s*1?>&\s*2\s*$/         and open(*STDOUT, ">&" . fileno(*STDERR))
             || die(<<"EOT" . "  $!");
 IPC::Exe::exe() cannot redirect STDOUT to STDERR
 EOT
@@ -347,9 +347,9 @@ EOT
             if (/^\s*(?:1><2|2><1)\s*$/)
             {
                 my $SWAP;
-                open($SWAP, ">&", *STDOUT)
-                    and open(*STDOUT, ">&", *STDERR)
-                    and open(*STDERR, ">&", $SWAP)
+                open($SWAP, ">&" . fileno(*STDOUT))
+                    and open(*STDOUT, ">&" . fileno(*STDERR))
+                    and open(*STDERR, ">&" . fileno($SWAP))
                     or die(<<"EOT" . "  $!");
 IPC::Exe::exe() cannot swap STDOUT and STDERR
 EOT
@@ -368,6 +368,8 @@ IPC::Exe::exe() cannot set binmode $fh_name for layer "$layer"
 EOT
             }
         }
+
+        local $" = " ";
 
         # non-Unix: escape command so that it feels Unix-like
         my @cmd = $non_unix
@@ -405,13 +407,8 @@ EOT
             }
 
             # assume exit status 255 indicates failed exec
-            {
-                no warnings qw(syntax);
-
-                exec { $cmd[0] } @cmd
-                    or ($! = -1)
-                    and die("IPC::Exe::exe() failed to exec: @cmd\n");
-            }
+            exec { $cmd[0] } @cmd
+                or die(($! = -1, "IPC::Exe::exe() failed to exec: @cmd\n")[1]);
         }
     }
 }
@@ -457,7 +454,7 @@ sub _bg {
 
     # dup(2) stdout
     my $ORIGSTDOUT;
-    open($ORIGSTDOUT, ">&", *STDOUT)
+    open($ORIGSTDOUT, ">&" . fileno(*STDOUT))
         or warn("IPC::Exe::bg() cannot dup(2) STDOUT\n  $!")
         and return ();
 
@@ -552,7 +549,7 @@ EOT
         unless ($gotgrand)
         {
             # restore stdout
-            open(*STDOUT, ">&", $ORIGSTDOUT)
+            open(*STDOUT, ">&" . fileno($ORIGSTDOUT))
                 or die("IPC::Exe::bg() cannot restore STDOUT\n  $!");
 
             # non-Unix: signal parent/child "process" to restore filehandles
@@ -614,11 +611,11 @@ sub _pipe_from_fork ($$$) {
             or warn("IPC::Exe cannot dup(2) STDIN\n  $!")
             and return undef;
 
-        open($ORIGSTDOUT, ">&", *STDOUT)
+        open($ORIGSTDOUT, ">&" . fileno(*STDOUT))
             or warn("IPC::Exe cannot dup(2) STDOUT\n  $!")
             and return undef;
 
-        open($ORIGSTDERR, ">&", *STDERR)
+        open($ORIGSTDERR, ">&" . fileno(*STDERR))
             or warn("IPC::Exe cannot dup(2) STDERR\n  $!")
             and return undef;
 
@@ -651,10 +648,10 @@ sub _pipe_from_fork ($$$) {
                 open(*STDIN, "<&" . fileno($ORIGSTDIN))
                     or die("IPC::Exe cannot restore STDIN\n  $!");
 
-                open(*STDOUT, ">&", $ORIGSTDOUT)
+                open(*STDOUT, ">&" . fileno($ORIGSTDOUT))
                     or die("IPC::Exe cannot restore STDOUT\n  $!");
 
-                open(*STDERR, ">&", $ORIGSTDERR)
+                open(*STDERR, ">&" . fileno($ORIGSTDERR))
                     or die("IPC::Exe cannot restore STDERR\n  $!");
             }
             else
@@ -663,7 +660,7 @@ sub _pipe_from_fork ($$$) {
                 close($_[1]);
 
                 # file descriptors are not "process"-persistent on Win32
-                open(*STDOUT, ">&", $WRITE)
+                open(*STDOUT, ">&" . fileno($WRITE))
                     or die("IPC::Exe cannot establish IPC after fork\n  $!");
             }
         }

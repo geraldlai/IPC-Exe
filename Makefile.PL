@@ -16,5 +16,6 @@ WriteMakefile(
 
     ($] >= 5.005 ?     ## Add these new keywords supported since 5.005
       (ABSTRACT_FROM  => 'lib/IPC/Exe.pm',
-       AUTHOR         => 'Gerald Lai') : ()),
+       LICENSE        => 'perl',
+       AUTHOR         => 'Gerald Lai <glai at cpan dot org>') : ()),
 );

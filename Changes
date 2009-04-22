@@ -1,5 +1,10 @@
 Revision history for IPC::Exe
 
+1.005    2009/04/21
+         - Fixed: unknown open() mode '>&' to be compatible with Perl 5.6+.
+         - Minor changes.
+         - Added: LICENSE to "META.yml".
+
 1.004    2009/04/20
          - Fixed: found = in conditional, should be ==.
            use warnings; doesn't understand what I mean.
