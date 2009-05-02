@@ -19,13 +19,13 @@ BEGIN {
     #   some of these platforms cannot fork()
     if ($^O =~ /^(?:VMS|dos|MacOS|riscos|amigaos|vmesa)$/)
     {
-        plan skip_all => "- Platform not supported: $^O";
+        plan skip_all => "- platform not supported: $^O";
     }
 }
 
 my $DEBUG = 0;
 
-BEGIN { plan tests => 46 }
+BEGIN { plan tests => 58 }
 #BEGIN { plan "no_plan" }
 
 # can we use the module?
@@ -68,9 +68,8 @@ my $gen_err = [
 ];
 
 # manual loop exit required for non-Unix platforms
-my $exit_loop = ($^O =~ /^(?:MSWin32|os2)$/)
-    ? 'last if /line[36]$/'
-    : '';
+my $non_unix = ($^O =~ /^(?:MSWin32|os2)$/);
+my $exit_loop = $non_unix ? 'last if /line[36]$/' : '';
 
 # create filters
 my $filt_out_1 = [
@@ -110,17 +109,28 @@ my $filt_err_out = [
         exe sub { "1>#" }, @{ $gen_out->[0] },
     };
 
+    ok( defined($pids1[0]), "exit: gen_out pid");
+    is($?        >> 8, 44, "exit: gen_out exit status \$?");
+    is($pids1[1] >> 8, 44, "exit: gen_out exit status return");
+
     my @pids2 = &{
         exe sub { "2>#" }, @{ $gen_err->[0] },
     };
 
-    ok( defined($pids1[0]), "exit: gen_out pid");
-    is($pids1[1] >> 8, 44, "exit: gen_out exit status");
+    ok( defined($pids2[0]), "exit: gen_err pid");
+    is($?        >> 8, 77, "exit: gen_err exit status \$?");
+    is($pids2[1] >> 8, 77, "exit: gen_err exit status return");
 
-    ok( defined($pids2[0]), "exit: gen_out pid");
-    is($pids2[1] >> 8, 77, "exit: gen_out exit status");
+    my @pids3 = &{
+        exe sub { "1>#" }, @{ $gen_out->[0] },
+        sub { $? = 33 << 8 }
+    };
 
-    diag Dumper(\@pids1, \@pids2) if $DEBUG;
+    ok( defined($pids3[0]), "fake_exit: gen_out pid");
+    is($?        >> 8, 33, "fake_exit: exit status \$?");
+    is($pids3[1] >> 8, 33, "fake_exit: exit status return");
+
+    diag Dumper(\@pids1, \@pids2, \@pids3) if $DEBUG;
 }
 
 # simple case
@@ -187,6 +197,21 @@ my $filt_err_out = [
     ok( defined($pids[0]), "two_filters: gen_out pid");
     ok( defined($pids[1]), "two_filters: filt_out_1 pid");
     ok( defined($pids[2]), "two_filters: filt_out_2 pid");
+
+    diag Dumper(\@pids) if $DEBUG;
+}
+
+# quoting
+{
+    my @pids = &{
+        exe $^X, '-e', 'print " \"\t\\\\\n"',
+        sub {
+            timeout {
+                my $result = <STDIN>;
+                is($result, " \"\t\\\n", $_[0]);
+            } "quoting: escaped argument";
+        },
+    };
 
     diag Dumper(\@pids) if $DEBUG;
 }
@@ -321,6 +346,148 @@ my $filt_err_out = [
     diag Dumper(\@pids) if $DEBUG;
 }
 
+# trickle pipe (data smaller than pipe buffer)
+{
+    my @pids = &{
+        exe sub {
+            print "a" x 50, "\n" for 1 .. 4;
+        },
+        sub {
+            timeout {
+                my $cnt = 0;
+
+                while (my $result = <STDIN>)
+                {
+                    chomp($result);
+                    ++$cnt if length($result) == 50;
+                }
+
+                is($cnt, 4, $_[0]);
+            } "trickle_pipe: perlsub generates lines";
+        },
+    };
+
+    diag Dumper(\@pids) if $DEBUG;
+}
+
+# trickle pipe program generates lines
+{
+    my @pids = &{
+        exe $^X, '-e', 'print "a" x 50, "\n" for 1 .. 4',
+        sub {
+            timeout {
+                my $cnt = 0;
+
+                while (my $result = <STDIN>)
+                {
+                    chomp($result);
+                    ++$cnt if length($result) == 50;
+                }
+
+                is($cnt, 4, $_[0]);
+            } "trickle_pipe: program generates lines";
+        },
+    };
+
+    diag Dumper(\@pids) if $DEBUG;
+}
+
+# burst pipe (data larger than pipe buffer)
+SKIP: {
+    skip("- burst_pipe: platform limitation", 1) if $non_unix;
+
+    my @pids = &{
+        exe sub {
+            print "a" x 100, "\n" for 1 .. 200;
+        },
+        sub {
+            timeout {
+                my $cnt = 0;
+
+                while (my $result = <STDIN>)
+                {
+                    chomp($result);
+                    ++$cnt if length($result) == 100;
+                }
+
+                is($cnt, 200, $_[0]);
+            } "burst_pipe: perlsub generates short lines";
+        },
+    };
+
+    diag Dumper(\@pids) if $DEBUG;
+}
+
+# burst pipe perlsub generates long lines
+SKIP: {
+    skip("- burst_pipe: platform limitation", 1) if $non_unix;
+
+    my @pids = &{
+        exe sub {
+            print "a" x 9000, "\n" for 1 .. 3;
+        },
+        sub {
+            timeout {
+                my $cnt = 0;
+
+                while (my $result = <STDIN>)
+                {
+                    chomp($result);
+                    ++$cnt if length($result) == 9000;
+                }
+
+                is($cnt, 3, $_[0]);
+            } "burst_pipe: perlsub generates long lines";
+        },
+    };
+
+    diag Dumper(\@pids) if $DEBUG;
+}
+
+# burst pipe program generates short lines
+{
+    my @pids = &{
+        exe $^X, '-e', 'print "a" x 100, "\n" for 1 .. 200',
+        sub {
+            timeout {
+                my $cnt = 0;
+
+                while (my $result = <STDIN>)
+                {
+                    chomp($result);
+                    ++$cnt if length($result) == 100;
+                }
+
+                is($cnt, 200, $_[0]);
+            } "burst_pipe: program generates short lines";
+        },
+    };
+
+    diag Dumper(\@pids) if $DEBUG;
+}
+
+# burst pipe program generates long lines
+{
+    my @pids = &{
+        exe $^X, '-e', 'print "a" x 9000, "\n" for 1 .. 3',
+        sub {
+            timeout {
+                my $cnt = 0;
+
+                while (my $result = <STDIN>)
+                {
+                    chomp($result);
+                    ++$cnt if length($result) == 9000;
+                }
+
+                is($cnt, 3, $_[0]);
+            } "burst_pipe: program generates long lines";
+        },
+    };
+
+    diag Dumper(\@pids) if $DEBUG;
+}
+
 # simple interactivity to STDOUT
 {
     local $SIG{CHLD} = 'IGNORE';
@@ -424,8 +591,8 @@ my $filt_err_out = [
 
 # background
 SKIP: {
-    skip("- Only available in DEBUG mode", 1) unless $DEBUG;
-    skip("- Time::HiRes::ualarm() not supported", 1) unless $got_ualarm;
+    skip("- background: only available in DEBUG mode", 1) unless $DEBUG;
+    skip("- background: Time::HiRes::ualarm() not supported", 1) unless $got_ualarm;
 
     # this is touchy - may fail sporadically depending on system load
     # time is not enough for exe() to complete

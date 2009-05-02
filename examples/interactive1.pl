@@ -3,6 +3,8 @@
 use warnings;
 use strict;
 
+use lib "../lib";
+
 use Data::Dumper;
 use IPC::Exe qw(exe);
 

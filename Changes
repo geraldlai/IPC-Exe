@@ -1,5 +1,24 @@
 Revision history for IPC::Exe
 
+1.006    2009/05/02
+         - RT #45413: A chain of trivial scripts is stuck under Win2k, works under Linux
+           Threaded fork-emulation has limitations.
+           Addressed by updating CAVEAT section in pod.
+           Added *_pipe tests to account for this.
+
+         - RT #45263: wrong constant intermediate exit code
+           Fixed: $? was getting clobbered by waitpid(). Added exit tests.
+
+         - &READER is now called with ($child_pid, LIST) as arguments.
+           $child_pid allows waitpid($_[0], 0); to be called in &READER to set $?
+
+         - Deprecated 'exec' option in %EXE_OPTIONS. No more use of system().
+         - Changed: improved non-Unix quoting. Added quoting test.
+         - Added: manually flush STDERR/STDOUT after &PREEXEC.
+         - Added: use POSIX::_exit() upon failed exec to avoid calling END blocks.
+         - Added: use lib "../lib"; to examples/*.pl
+         - Minor changes to "README" and "Makefile.PL".
+
 1.005    2009/04/21
          - Fixed: unknown open() mode '>&' to be compatible with Perl 5.6+.
          - Minor changes.

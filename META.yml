@@ -1,16 +1,22 @@
 --- #YAML:1.0
-name:                IPC-Exe
-version:             1.005
-abstract:            Execute processes or Perl subroutines & string them via IPC. Think shell pipes.
-license:             perl
-author:              
+name:               IPC-Exe
+version:            1.006
+abstract:           Execute processes or Perl subroutines & string them via IPC. Think shell pipes.
+author:
     - Gerald Lai <glai at cpan dot org>
-generated_by:        ExtUtils::MakeMaker version 6.44
-distribution_type:   module
-requires:     
-    File::Spec:                    0
-    POSIX:                         0
-    Time::HiRes:                   0
+license:            perl
+distribution_type:  module
+configure_requires:
+    ExtUtils::MakeMaker:  0
+requires:
+    File::Spec:   0
+    POSIX:        0
+    Time::HiRes:  0
+no_index:
+    directory:
+        - t
+        - inc
+generated_by:       ExtUtils::MakeMaker version 6.48
 meta-spec:
-    url:     http://module-build.sourceforge.net/META-spec-v1.3.html
-    version: 1.3
+    url:      http://module-build.sourceforge.net/META-spec-v1.4.html
+    version:  1.4

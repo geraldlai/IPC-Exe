@@ -21,9 +21,5 @@ To install this module, run the following commands:
 
 DEPENDENCIES
 
-This module requires these other modules and libraries:
-
-    POSIX
-    File::Spec
-    Time::HiRes
+See "Makefile.PL" under PREREQ_PM key.
 
