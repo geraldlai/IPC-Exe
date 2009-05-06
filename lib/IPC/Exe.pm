@@ -12,11 +12,11 @@ BEGIN {
     require Exporter;
     *import = \&Exporter::import; # just inherit import() only
 
-    our $VERSION   = 1.006;
+    our $VERSION   = 1.007;
     our @EXPORT_OK = qw(&exe &bg);
 }
 
-use POSIX qw(WNOHANG _exit);
+use POSIX qw(WNOHANG);
 use File::Spec qw();
 use Time::HiRes qw(usleep);
 
@@ -29,10 +29,20 @@ my $non_unix = ($^O =~ /^(?:MSWin32|os2)$/);
 # bg() fallback to forked child/parent process to ensure execution
 our $bg_fallback = 0;
 
+# create package-scope $IPC::Exe::is_forked
+our $is_forked = 0;
+
 # check ref type
 sub _is_hash { ref($_[0]) && eval { %{ $_[0] } or 1 } }
 sub _is_code { UNIVERSAL::isa($_[0], "CODE") }
 sub _is_fh   { eval { defined(fileno($_[0])) } }
+
+# exit thread/process
+sub _quit {
+    my $status = shift() || 0;
+    threads->exit($status) if threads->can("exit");
+    exit($status);
+}
 
 # closure allows exe() to do its magical arguments arrangement
 sub exe {
@@ -89,7 +99,7 @@ sub _exe {
     if ($opt{stdin})
     {
         pipe($FOR_STDIN, $TO_STDIN)
-            or warn("IPC::Exe::exe() cannot create pipe to STDIN\n  $!")
+            or warn("IPC::Exe::exe() cannot create pipe to STDIN", "\n  ", $!)
             and return ();
 
         # make filehandle hot
@@ -101,7 +111,7 @@ sub _exe {
     if ($opt{stderr})
     {
         pipe($FROM_STDERR, $BY_STDERR)
-            or warn("IPC::Exe::exe() cannot create pipe from STDERR\n  $!")
+            or warn("IPC::Exe::exe() cannot create pipe from STDERR", "\n  ", $!)
             and return ();
     }
 
@@ -109,13 +119,22 @@ sub _exe {
     my $Preexec = shift() if _is_code($_[0]);
     my $Reader  =   pop() if _is_code($_[$#_]);
 
+    # check for undefined values in LIST
+    if (grep { !defined() } @_)
+    {
+        warn("IPC::Exe::exe() cannot execute undef argument(s) below:", "\n  ",
+            join(" " => map { defined() ? "<$_>" : "[undef]" } @_), "\n");
+        return ();
+    }
+
     # as a precaution, do not continue if no PREEXEC or LIST found
     return () unless defined($Preexec) || @_;
 
-    # dup(2) stdin to be restored later
+    # duplicate stdin to be restored later
     my $ORIGSTDIN;
     open($ORIGSTDIN, "<&=" . fileno(*STDIN))
-        or warn("IPC::Exe::exe() cannot dup(2) STDIN\n  $!")
+        or open($ORIGSTDIN, "<&" . fileno(*STDIN)) # fallback
+        or warn("IPC::Exe::exe() cannot fdopen STDIN", "\n  ", $!)
         and return ();
 
     # safe pipe open to forked child connected to opened filehandle
@@ -125,7 +144,7 @@ sub _exe {
     # check if fork was successful
     unless ($defined_child)
     {
-        warn("IPC::Exe::exe() cannot fork child\n  $!") and return ();
+        warn("IPC::Exe::exe() cannot fork child", "\n  ", $!) and return ();
     }
 
     # parent reads stdout of child process
@@ -143,12 +162,12 @@ sub _exe {
 
             if ($opt{stdin})
             {
-                binmode($TO_STDIN, $layer) or die(<<"EOT" . "  $!");
+                binmode($TO_STDIN, $layer) or die(<<"EOT", "  ", $!);
 IPC::Exe::exe() cannot set binmode STDIN_WRITEHANDLE for layer "$layer"
 EOT
             }
 
-            binmode($EXE_READ, $layer) or die(<<"EOT" . "  $!");
+            binmode($EXE_READ, $layer) or die(<<"EOT", "  ", $!);
 IPC::Exe::exe() cannot set binmode STDOUT_READHANDLE for layer "$layer"
 EOT
         }
@@ -157,9 +176,9 @@ EOT
         $IPC::Exe::_stdin
             ? open(*STDIN, "<&=" . fileno($EXE_READ))
             : open(*STDIN, "<&"  . fileno($EXE_READ))
-                or die("IPC::Exe::exe() cannot replace STDIN\n  $!");
+                or die("IPC::Exe::exe() cannot replace STDIN", "\n  ", $!);
 
-        # create package-scope $IPC::Exe::PIPE
+        # create local package-scope $IPC::Exe::PIPE
         local our $PIPE = $EXE_READ;
 
         my (@ret, $status_reader);
@@ -182,7 +201,8 @@ EOT
 
         # restore stdin
         open(*STDIN, "<&=" . fileno($ORIGSTDIN))
-            or die("IPC::Exe::exe() cannot restore STDIN\n  $!");
+            or open(*STDIN, "<&" . fileno($ORIGSTDIN)) # fallback
+            or die("IPC::Exe::exe() cannot restore STDIN", "\n  ", $!);
 
         # non-blocking wait for interactive children
         my $reap = waitpid($gotchild, $IPC::Exe::_stdin ? WNOHANG : 0);
@@ -209,7 +229,7 @@ EOT
             $ret_pid = 0 if ( (!$Reader && !$opt{stdout} # using default &READER
                             && ($reap == $gotchild || $reap == -1 || $reap == 0)
                             && ($ret[0] = -1)) # return -1
-		            || $reap == $gotchild);
+                            || $reap == $gotchild);
         }
 
         # writing to failed exec
@@ -234,27 +254,30 @@ EOT
     }
     else # child performs exec()
     {
-        # close unneeded filehandles
-        close($TO_STDIN)    if $TO_STDIN;
-        close($FROM_STDERR) if $FROM_STDERR;
+        # set package-scope $IPC::Exe::is_forked
+        $is_forked = 1;
 
         # disassociate any ties with parent
         untie(*STDIN);
         untie(*STDOUT);
         untie(*STDERR);
 
+        # close unneeded filehandles
+        close($TO_STDIN)    if $TO_STDIN;
+        close($FROM_STDERR) if $FROM_STDERR;
+
         # change STDIN if input filehandle was required
         if ($FOR_STDIN)
         {
             open(*STDIN, "<&" . fileno($FOR_STDIN))
-                or die("IPC::Exe::exe() cannot change STDIN\n  $!");
+                or die("IPC::Exe::exe() cannot change STDIN", "\n  ", $!);
         }
 
         # collect STDERR if error filehandle was required
         if ($BY_STDERR)
         {
             open(*STDERR, ">&" . fileno($BY_STDERR))
-                or die("IPC::Exe::exe() cannot collect STDERR\n  $!");
+                or die("IPC::Exe::exe() cannot collect STDERR", "\n  ", $!);
         }
 
         # set binmode if required
@@ -264,7 +287,7 @@ EOT
             my $layer = $IPC::Exe::_binmode_io;
 
             binmode(*STDIN, $layer) and binmode(*STDOUT, $layer)
-                or die(<<"EOT" . "  $!");
+                or die(<<"EOT", "  ", $!);
 IPC::Exe::exe() cannot set binmode STDIN and STDOUT for layer "$layer"
 EOT
         }
@@ -290,7 +313,7 @@ EOT
                 close($EXE_GO);
             }
 
-            exit(0);
+            _quit(0);
         }
 
         # perform redirections
@@ -300,25 +323,25 @@ EOT
 
             # silence stderr
             /^\s*2>\s*(?:null|#)\s*$/  and open(*STDERR, ">", $DEVNULL)
-            || die(<<"EOT" . "  $!");
+            || die(<<"EOT", "  ", $!);
 IPC::Exe::exe() cannot silence STDERR (does $DEVNULL exist?)
 EOT
 
             # silence stdout
             /^\s*1?>\s*(?:null|#)\s*$/ and open(*STDOUT, ">", $DEVNULL)
-            || die(<<"EOT" . "  $!");
+            || die(<<"EOT", "  ", $!);
 IPC::Exe::exe() cannot silence STDOUT (does $DEVNULL exist?)
 EOT
 
             # redirect stderr to stdout
             /^\s*2>&\s*1\s*$/          and open(*STDERR, ">&" . fileno(*STDOUT))
-            || die(<<"EOT" . "  $!");
+            || die(<<"EOT", "  ", $!);
 IPC::Exe::exe() cannot redirect STDERR to STDOUT
 EOT
 
             # redirect stdout to stderr
             /^\s*1?>&\s*2\s*$/         and open(*STDOUT, ">&" . fileno(*STDERR))
-            || die(<<"EOT" . "  $!");
+            || die(<<"EOT", "  ", $!);
 IPC::Exe::exe() cannot redirect STDOUT to STDERR
 EOT
 
@@ -329,7 +352,7 @@ EOT
                 open($SWAP, ">&" . fileno(*STDOUT))
                     and open(*STDOUT, ">&" . fileno(*STDERR))
                     and open(*STDERR, ">&" . fileno($SWAP))
-                    or die(<<"EOT" . "  $!");
+                    or die(<<"EOT", "  ", $!);
 IPC::Exe::exe() cannot swap STDOUT and STDERR
 EOT
             }
@@ -342,13 +365,11 @@ EOT
                 $layer = ":raw" if $layer eq ":";
 
                 binmode((*STDIN, *STDOUT, *STDERR)[$1], $layer)
-                    or die(<<"EOT" . "  $!");
+                    or die(<<"EOT", "  ", $!);
 IPC::Exe::exe() cannot set binmode $fh_name for layer "$layer"
 EOT
             }
         }
-
-        local $" = " ";
 
         # non-Unix: escape command so that it feels Unix-like
         my @cmd = $non_unix
@@ -366,10 +387,13 @@ EOT
             close($EXE_GO);
         }
 
+        no warnings qw(exec);
+
         # assume exit status 255 indicates failed exec
         exec { $cmd[0] } @cmd
-            or warn("IPC::Exe::exe() failed to exec: @cmd\n")
-            and $non_unix ? exit(-1) : _exit(-1);
+            or warn("IPC::Exe::exe() failed to exec the command below", " - ", $!, "\n  ",
+                   join(" " => map { "<$_>" } @cmd), "\n")
+            and _quit(-1);
     }
 }
 
@@ -415,7 +439,7 @@ sub _bg {
     # dup(2) stdout
     my $ORIGSTDOUT;
     open($ORIGSTDOUT, ">&" . fileno(*STDOUT))
-        or warn("IPC::Exe::bg() cannot dup(2) STDOUT\n  $!")
+        or warn("IPC::Exe::bg() cannot dup(2) STDOUT", "\n  ", $!)
         and return ();
 
     # double fork -- immediately wait() for child,
@@ -431,11 +455,11 @@ sub _bg {
         # decide whether bg() should fallback upon unsuccessful forks
         if ($bg_fallback)
         {
-            warn("IPC::Exe::bg() cannot fork child, will try fork again\n  $!");
+            warn("IPC::Exe::bg() cannot fork child, will try fork again", "\n  ", $!);
         }
         else
         {
-            warn("IPC::Exe::bg() cannot fork child\n  $!") and return ();
+            warn("IPC::Exe::bg() cannot fork child", "\n  ", $!) and return ();
         }
     }
 
@@ -462,7 +486,7 @@ sub _bg {
         if ($defined_child)
         {
             $defined_grand
-                or warn(<<"EOT" . "  $!");
+                or warn(<<"EOT", "  ", $!);
 IPC::Exe::bg() cannot fork grandchild, using child instead
  -> parent must wait
 EOT
@@ -472,14 +496,14 @@ EOT
             if ($defined_grand)
             {
                 $gotgrand
-                    and warn(<<"EOT" . "  $!");
+                    and warn(<<"EOT", "  ", $!);
 IPC::Exe::bg() managed to fork child, using child now
  -> parent must wait
 EOT
             }
             else
             {
-                warn(<<"EOT" . "  $!");
+                warn(<<"EOT", "  ", $!);
 IPC::Exe::bg() cannot fork child again, using parent instead
  -> parent does all the work
 EOT
@@ -493,7 +517,7 @@ EOT
             if ($defined_child)
             {
                 # child writes grandchild's PID to parent process
-                print $gotgrand;
+                print "$gotgrand\n";
             }
             else
             {
@@ -506,9 +530,17 @@ EOT
         # grandchild calls BACKGROUND subroutine
         unless ($gotgrand)
         {
+            # set package-scope $IPC::Exe::is_forked
+            $is_forked = 1;
+
+            # disassociate any ties with parent
+            untie(*STDIN);
+            untie(*STDOUT);
+            untie(*STDERR);
+
             # restore stdout
             open(*STDOUT, ">&" . fileno($ORIGSTDOUT))
-                or die("IPC::Exe::bg() cannot restore STDOUT\n  $!");
+                or die("IPC::Exe::bg() cannot restore STDOUT", "\n  ", $!);
 
             # non-Unix: signal parent/child "process" to restore filehandles
             if ($non_unix)
@@ -541,9 +573,9 @@ EOT
         #   childpid    undef      child
         #    undef     childpid    child
         #    undef      undef      none (parent executes BACKGROUND subroutine)
-        exit(0)  if  $defined_child &&  $defined_grand;
-        exit(10) if  $defined_child && !$defined_grand;
-        exit(10) if !$defined_child &&  $defined_grand && !$gotgrand;
+        _quit(0)  if  $defined_child &&  $defined_grand;
+        _quit(10) if  $defined_child && !$defined_grand;
+        _quit(10) if !$defined_child &&  $defined_grand && !$gotgrand;
 
         # falls back here if forks were unsuccessful
         return $childpid;
@@ -566,15 +598,15 @@ sub _pipe_from_fork ($$) {
         my ($ORIGSTDIN, $ORIGSTDOUT, $ORIGSTDERR);
 
         open($ORIGSTDIN, "<&" . fileno(*STDIN))
-            or warn("IPC::Exe cannot dup(2) STDIN\n  $!")
+            or warn("IPC::Exe cannot dup(2) STDIN", "\n  ", $!)
             and return undef;
 
         open($ORIGSTDOUT, ">&" . fileno(*STDOUT))
-            or warn("IPC::Exe cannot dup(2) STDOUT\n  $!")
+            or warn("IPC::Exe cannot dup(2) STDOUT", "\n  ", $!)
             and return undef;
 
         open($ORIGSTDERR, ">&" . fileno(*STDERR))
-            or warn("IPC::Exe cannot dup(2) STDERR\n  $!")
+            or warn("IPC::Exe cannot dup(2) STDERR", "\n  ", $!)
             and return undef;
 
         # create pipe for READHANDLE and WRITEHANDLE
@@ -596,21 +628,21 @@ sub _pipe_from_fork ($$) {
                 readline($READY);
 
                 # restore filehandles after slight delay to allow exec to happen
-                my $wait = 400e-6; # default
+                my $wait = 200e-6; # default
                 $wait = $IPC::Exe::_preexec_wait
                     if defined($IPC::Exe::_preexec_wait);
 
                 usleep($wait * 1e6);
                 #print STDERR "wait> $wait\n";
 
-                open(*STDIN, "<&=" . fileno($ORIGSTDIN))
-                    or die("IPC::Exe cannot restore STDIN\n  $!");
+                open(*STDIN, "<&" . fileno($ORIGSTDIN))
+                    or die("IPC::Exe cannot restore STDIN", "\n  ", $!);
 
-                open(*STDOUT, ">&=" . fileno($ORIGSTDOUT))
-                    or die("IPC::Exe cannot restore STDOUT\n  $!");
+                open(*STDOUT, ">&" . fileno($ORIGSTDOUT))
+                    or die("IPC::Exe cannot restore STDOUT", "\n  ", $!);
 
-                open(*STDERR, ">&=" . fileno($ORIGSTDERR))
-                    or die("IPC::Exe cannot restore STDERR\n  $!");
+                open(*STDERR, ">&" . fileno($ORIGSTDERR))
+                    or die("IPC::Exe cannot restore STDERR", "\n  ", $!);
             }
             else
             {
@@ -619,7 +651,7 @@ sub _pipe_from_fork ($$) {
 
                 # file descriptors are not "process"-persistent on Win32
                 open(*STDOUT, ">&" . fileno($WRITE))
-                    or die("IPC::Exe cannot establish IPC after fork\n  $!");
+                    or die("IPC::Exe cannot establish IPC after fork", "\n  ", $!);
             }
         }
     }
@@ -695,7 +727,7 @@ Extending the previous example,
 
 can be replaced with
 
-  my $exit = &{ exe sub { open(STDOUT, '>', 'out.txt') or die }, 'myprog', $arg1, $arg2, };
+  my $exit = &{ exe sub { open(STDOUT, '>', 'out.txt') or die $! }, 'myprog', $arg1, $arg2, };
 
 The previous two examples will wait for 'myprog' to finish executing before continuing the main program.
 
@@ -707,7 +739,7 @@ Extending the previous example again,
 can be replaced with
 
   # just add 'bg' before 'exe' in previous example
-  my $bg_pid = &{ bg exe sub { open(STDOUT, '>', 'out.txt') or die }, 'myprog', $arg1, $arg2, };
+  my $bg_pid = &{ bg exe sub { open(STDOUT, '>', 'out.txt') or die $! }, 'myprog', $arg1, $arg2, };
 
 Now, 'myprog' will be put in background and the main program will continue without waiting.
 
@@ -717,7 +749,7 @@ To monitor the exit value of a background process:
       bg sub {
              # same as 2nd previous example
              my ($pid) = &{
-                 exe sub { open(STDOUT, '>', 'out.txt') or die }, 'myprog', $arg1, $arg2,
+                 exe sub { open(STDOUT, '>', 'out.txt') or die $! }, 'myprog', $arg1, $arg2,
              };
 
              # check if exe() was successful
@@ -771,8 +803,8 @@ Perform tar copy of an entire directory:
   use Cwd qw(chdir);
 
   my @pids = &{
-      exe sub { chdir $source_dir or die }, qw(/bin/tar  cf - .),
-      exe sub { chdir $target_dir or die }, qw(/bin/tar xBf -),
+      exe sub { chdir $source_dir or die $! }, qw(/bin/tar  cf - .),
+      exe sub { chdir $target_dir or die $! }, qw(/bin/tar xBf -),
   };
 
   # check if exe()'s were successful
@@ -810,9 +842,11 @@ Here is an elaborate example to pipe C<STDOUT> of one process to the C<STDIN> of
       # [perlsub] receives STDOUT of 'sort'
       exe sub {
               # find out command of previous pipe process
-              # if @_ is empty list, previous process was a [perlsub]
+              # if @_[1..$#_] is an empty list, previous process was a [perlsub]
               my ($child_pid, $prog, @args) = @_;
-              print STDERR "last_pipe[$child_pid]> $prog @args\n"; # output: "last_pipe[12345]> sort -n"
+
+              # output: "last_pipe[12345]> sort -n"
+              print STDERR "last_pipe[$child_pid]> $prog @args\n";
 
               # print sorted, 'perl' filtered, output of $program
               print while <STDIN>;
@@ -889,7 +923,7 @@ Of course, more C<exe( )> calls may be chained together as needed:
   close($TO_STDIN);
   close($FROM_STDOUT);
 
-B<Important:> Some non-Unix platforms, such as Win32, require interactive processes (shown above) to know when to quit, and can neither rely on C<close($TO_STDIN)>, nor C<< kill TERM => $pid; >>
+B<Important:> Some non-Unix platforms, such as Win32, require interactive processes (shown above) to know when to quit, and can neither rely on C<close($TO_STDIN)>, nor C<< kill(TERM => $pid); >>
 
 
 =head1 SUBROUTINES
@@ -921,7 +955,7 @@ Optionally, C<&PREEXEC> could return a LIST of strings to perform common filehan
   "1:raw" or "1:"      does binmode(STDOUT, ":raw");
   "2:utf8"             does binmode(STDERR, ":utf8");
 
-C<&READER> is called with C<($child_pid, LIST)> as its arguments. C<LIST> corresponds to the arguments passed in-between C<&PREEXEC> and C<&READER>.
+C<&READER> is called with C<($child_pid, LIST)> as its arguments. C<LIST> corresponds to the positional arguments passed in-between C<&PREEXEC> and C<&READER>.
 
 If C<exe( )>'s are chained, C<&READER> calls itself as the next C<exe( )> in line, which in turn, calls the next C<&PREEXEC>, C<LIST>, etc.
 
@@ -933,7 +967,7 @@ C<&PREEXEC> is always called in the child process.
 
 C<&PREEXEC> and C<&READER> are very similar and may be treated the same.
 
-It is important to note that the actions & return of C<&PREEXEC> matters, as it may be used to redirect filehandles before &PREEXEC becomes the exec process.
+It is important to note that the actions & return of C<&PREEXEC> matters, as it may be used to redirect filehandles before C<&PREEXEC> becomes the exec process.
 
 C<waitpid( $_[0], 0 )> in C<&READER> to set exit status C<$?> of previous process executing on the pipe. C<close( $IPC::Exe::PIPE )> can also be used to close the input filehandle and set C<$?> at the same time (for Unix platforms only).
 
@@ -947,7 +981,7 @@ If C<&READER> is not provided, it defaults to
 
 C<exe( &READER )> returns C<&READER>.
 
-C<exe( )> returns an empty list.
+C<exe( )> with no arguments returns an empty list.
 
 =head2 bg( )
 
@@ -960,7 +994,7 @@ C<&BACKGROUND> is called after it is sent to the init process.
 
 If C<&BACKGROUND> is not a CODE reference, return an empty list upon execution.
 
-C<bg( )> returns an empty list.
+C<bg( )> with no arguments returns an empty list.
 
 This experimental feature is not enabled by default:
 
@@ -1054,7 +1088,7 @@ When C<exe( )> executes a C<&READER> subroutine, the subroutine's return value i
 
 It returns C<$?>, which is the status of the last pipe process close. This allows code to be written like:
 
-  my $exit = &{ exe 'myprog', $myarg };
+  my $exit = &{ exe 'myprog', $myarg }; # $exit = ($myprog_pid, $myprog_exit_status);
 
 =item *
 
@@ -1141,6 +1175,24 @@ as
 
 =head1 CAVEAT
 
+=head2 END { } blocks
+
+Code declared in END blocks will be called upon exit, whether it be after C<&PREEXEC> sub without a LIST command, from a C<die> failure, or even a failed C<exec> call.
+
+The user should make provisions to handle this situation. This is desirable when END blocks must B<only> be called in the main process (or thread).
+
+C<$IPC::Exe::is_forked> is set to true after the code forks in C<&PREEXEC> and C<&BACKGROUND>. It can be used to tell the main process/thread apart from child processes/threads:
+
+  END {
+      # only run in main process/thread
+      return if $IPC::Exe::is_forked;
+
+      ### REST OF THE CODE GOES HERE ###
+      ...
+  }
+
+=head2 PLATFORMS
+
 This module is targeted for Unix environments, using techniques described in perlipc and perlfaq8. Development is done on FreeBSD, Linux, and Win32 platforms. It may not work well on other non-Unix systems, let alone Win32.
 
 =head2 MSWin32
@@ -1162,7 +1214,7 @@ For example, this code below will B<block>:
           sub { @result = <STDIN> }                  # sub is &READER
   };
 
-The execution stalls, and the program just hangs there. C<&PREEXEC> is writing out more data than the pipe buffer can fit. Once the buffer is full, C<print> will block to wait for the buffer to be emptied. However, C<&READER> is not able to continue and read off some data from the pipe buffer because it is in the same blocked process. If it were in a separate process (as in a real C<fork>), than a blocking B<&PREEXEC> cannot affect the C<&READER>.
+The execution stalls, and the program just hangs there. C<&PREEXEC> is writing out more data than the pipe buffer can fit. Once the buffer is full, C<print> will block to wait for the buffer to be emptied. However, C<&READER> is not able to continue and read off some data from the pipe buffer because it is in the same blocked process. If it were in a separate process (as in a real C<fork>), than a blocking C<&PREEXEC> cannot affect the C<&READER>.
 
 The way to ensure C<exe( )> works smoothly on Win32 is to C<exec> processes on the pipeline chain. This code will work instead:
 

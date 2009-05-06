@@ -1,5 +1,18 @@
 Revision history for IPC::Exe
 
+1.007    2009/05/05
+         - Changed: removed POSIX::_exit() because it got in the way of threads.
+           Unfortunately, END blocks are performed as a result of die() or exit().
+           I haven't found a reliable way to avoid END blocks inside a thread.
+           Addressed by updating CAVEAT section in pod.
+
+         - Added: $IPC::Exe::is_forked to tell if code is not in main process/thread.
+           Added is_forked test.
+
+         - Fixed: smoke test failures duplicating STDIN. We'll see if the fix works.
+         - Added: check for undef values in LIST. Added undef_cmd test.
+         - Minor pod corrections.
+
 1.006    2009/05/02
          - RT #45413: A chain of trivial scripts is stuck under Win2k, works under Linux
            Threaded fork-emulation has limitations.

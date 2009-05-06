@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               IPC-Exe
-version:            1.006
+version:            1.007
 abstract:           Execute processes or Perl subroutines & string them via IPC. Think shell pipes.
 author:
     - Gerald Lai <glai at cpan dot org>

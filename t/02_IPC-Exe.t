@@ -25,7 +25,7 @@ BEGIN {
 
 my $DEBUG = 0;
 
-BEGIN { plan tests => 58 }
+BEGIN { plan tests => 61 }
 #BEGIN { plan "no_plan" }
 
 # can we use the module?
@@ -277,6 +277,19 @@ my $filt_err_out = [
     diag Dumper(\@pids) if $DEBUG;
 }
 
+# undefined command
+{
+    local $SIG{__WARN__} = sub { }; # silence warning
+
+    my @pids = &{
+        exe sub { "2>#" }, undef,
+    };
+
+    is_deeply(\@pids, [ ], "undef_cmd: return empty list");
+
+    diag Dumper(\@pids) if $DEBUG;
+}
+
 # bad command
 {
     my @pids = &{
@@ -482,6 +495,26 @@ SKIP: {
 
                 is($cnt, 3, $_[0]);
             } "burst_pipe: program generates long lines";
+        },
+    };
+
+    diag Dumper(\@pids) if $DEBUG;
+}
+
+# in forked thread/process?
+{
+    my @pids = &{
+        exe sub {
+                print "forked\n" if $IPC::Exe::is_forked;
+                print "failed\n";
+            },
+        sub {
+            timeout {
+                chomp(my $result = <STDIN>);
+                is($result, "forked", $_[0] . "child");
+
+                ok(!$IPC::Exe::is_forked, $_[0] . "parent");
+            } "is_forked: in exe() ";
         },
     };
 
