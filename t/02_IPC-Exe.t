@@ -5,8 +5,7 @@ use Test::More;
 use Scalar::Util qw(refaddr);
 use Data::Dumper;
 
-eval "use Time::HiRes qw(ualarm)";
-my $got_ualarm = !$@;
+eval "use Time::HiRes qw(alarm)";
 
 BEGIN {
     # need 5.6+ for lexical filehandles
@@ -25,7 +24,7 @@ BEGIN {
 
 my $DEBUG = 0;
 
-BEGIN { plan tests => 61 }
+BEGIN { plan tests => 70 }
 #BEGIN { plan "no_plan" }
 
 # can we use the module?
@@ -44,9 +43,9 @@ sub timeout (&@) {
     eval {
         local $SIG{ALRM} = sub { die("alarm\n") };
 
-        $got_ualarm ? ualarm($wait * 1e6) : alarm($wait);
+        alarm($wait);
         $cb->($test_name); # potentially long operation
-        $got_ualarm ? ualarm(0) : alarm(0);
+        alarm(0);
 
         1;
     } or do {
@@ -110,27 +109,52 @@ my $filt_err_out = [
     };
 
     ok( defined($pids1[0]), "exit: gen_out pid");
-    is($?        >> 8, 44, "exit: gen_out exit status \$?");
-    is($pids1[1] >> 8, 44, "exit: gen_out exit status return");
+    is($?        >> 8, 44,  "exit: gen_out exit status \$?");
+    is($pids1[1] >> 8, 44,  "exit: gen_out exit status return");
 
     my @pids2 = &{
         exe sub { "2>#" }, @{ $gen_err->[0] },
     };
 
     ok( defined($pids2[0]), "exit: gen_err pid");
-    is($?        >> 8, 77, "exit: gen_err exit status \$?");
-    is($pids2[1] >> 8, 77, "exit: gen_err exit status return");
+    is($?        >> 8, 77,  "exit: gen_err exit status \$?");
+    is($pids2[1] >> 8, 77,  "exit: gen_err exit status return");
 
     my @pids3 = &{
         exe sub { "1>#" }, @{ $gen_out->[0] },
         sub { $? = 33 << 8 }
     };
 
-    ok( defined($pids3[0]), "fake_exit: gen_out pid");
-    is($?        >> 8, 33, "fake_exit: exit status \$?");
-    is($pids3[1] >> 8, 33, "fake_exit: exit status return");
+    ok( defined($pids3[0]), "exit_fake: gen_out pid");
+    is($?        >> 8, 33,  "exit_fake: exit status \$?");
+    is($pids3[1] >> 8, 33,  "exit_fake: exit status return");
 
-    diag Dumper(\@pids1, \@pids2, \@pids3) if $DEBUG;
+    my @pids4 = &{
+        exe sub { "1>#" }, @{ $gen_out->[0] },
+        sub { $? = 33 << 8; waitpid($_[0], 0); $? }
+    };
+
+    ok( defined($pids4[0]), "exit_waitpid: gen_out pid");
+    is($?        >> 8, 44,  "exit_waitpid: exit status \$?");
+    is($pids4[1] >> 8, 44,  "exit_waitpid: exit status return");
+
+    diag Dumper(\@pids1, \@pids2, \@pids3, \@pids4) if $DEBUG;
+}
+
+# exit status by closing pipe
+SKIP: {
+    skip("- exit_close_pipe: platform limitation", 3) if $non_unix;
+
+    my @pids = &{
+        exe sub { "1>#" }, @{ $gen_out->[0] },
+        sub { $? = 33 << 8; close($IPC::Exe::PIPE); $? }
+    };
+
+    ok( defined($pids[0]), "exit_close_pipe: gen_out pid");
+    is($?       >> 8, 44,  "exit_close_pipe: exit status \$?");
+    is($pids[1] >> 8, 44,  "exit_close_pipe: exit status return");
+
+    diag Dumper(\@pids) if $DEBUG;
 }
 
 # simple case
@@ -212,6 +236,32 @@ my $filt_err_out = [
             } "quoting: escaped argument";
         },
     };
+
+    diag Dumper(\@pids) if $DEBUG;
+}
+
+# arguments to &PREEXEC and &READER
+{
+    my $cb =
+        exe sub { print "$_\n" for @_ }, @{ $gen_out->[0] },
+        sub {
+            timeout {
+                chomp(my @result = <STDIN>);
+                my @expected = (
+                    @{ $gen_err->[1] },
+                    @{ $gen_out->[1] },
+                );
+
+                is_deeply(\@result, \@expected, $_[0]);
+            } "arguments: to &PREEXEC";
+
+            return [ @_ ];
+        };
+
+    my @pids = $cb->(@{ $gen_err->[1] });
+
+    ok( defined($pids[0]), "arguments: gen_out pid");
+    is_deeply($pids[1], [ $pids[0], @{ $gen_out->[0] } ], "arguments: to &READER");
 
     diag Dumper(\@pids) if $DEBUG;
 }
@@ -625,7 +675,6 @@ SKIP: {
 # background
 SKIP: {
     skip("- background: only available in DEBUG mode", 1) unless $DEBUG;
-    skip("- background: Time::HiRes::ualarm() not supported", 1) unless $got_ualarm;
 
     # this is touchy - may fail sporadically depending on system load
     # time is not enough for exe() to complete

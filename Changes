@@ -1,5 +1,12 @@
 Revision history for IPC::Exe
 
+1.008    2009/05/13
+         - Added: arguments, exit_waitpid and exit_close_pipe tests.
+         - Changed: tests no longer use ualarm() because it is unavailable sometimes.
+         - Further improvement of non-Unix quoting.
+         - Cleaned up aliasing code.
+         - Tried another fix for smoke test failures duplicating STDIN.
+
 1.007    2009/05/05
          - Changed: removed POSIX::_exit() because it got in the way of threads.
            Unfortunately, END blocks are performed as a result of die() or exit().

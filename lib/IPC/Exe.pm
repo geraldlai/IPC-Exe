@@ -12,7 +12,7 @@ BEGIN {
     require Exporter;
     *import = \&Exporter::import; # just inherit import() only
 
-    our $VERSION   = 1.007;
+    our $VERSION   = 1.008;
     our @EXPORT_OK = qw(&exe &bg);
 }
 
@@ -61,10 +61,7 @@ sub exe {
 
     # otherwise return closure
     my @args = @_;
-    return sub {
-        my @_closure = @_;
-        _exe(\@_closure, @args);
-    }
+    return sub { _exe([ @_ ], @args) };
 }
 sub _exe {
     # obtain reference to arguments passed to closure
@@ -78,9 +75,9 @@ sub _exe {
         autoflush  => 1,
         binmode_io => undef,
     );
-    if (_is_hash($_[0]))
+    if (_is_hash(my $opt_ref = $_[0]))
     {
-        @opt{keys %{ $_[0] }} = values %{ $_[0] };
+        @opt{keys %{ $opt_ref }} = values %{ $opt_ref };
         shift();
     }
 
@@ -116,26 +113,31 @@ sub _exe {
     }
 
     # obtain CODE references, if available, for READER & PREEXEC subroutines
-    my $Preexec = shift() if _is_code($_[0]);
-    my $Reader  =   pop() if _is_code($_[$#_]);
+    my $code_ref;
+    my $Preexec = shift() if _is_code($code_ref = $_[0]);
+    my $Reader  =   pop() if _is_code($code_ref = $_[-1]);
+
+    # what is left is the command LIST
+    my @cmd_list = @_;
 
     # check for undefined values in LIST
-    if (grep { !defined() } @_)
+    if (grep { !defined() } @cmd_list)
     {
         warn("IPC::Exe::exe() cannot execute undef argument(s) below:", "\n  ",
-            join(" " => map { defined() ? "<$_>" : "[undef]" } @_), "\n");
+            join(" " => map { defined() ? "<$_>" : "[undef]" } @cmd_list), "\n");
         return ();
     }
 
     # as a precaution, do not continue if no PREEXEC or LIST found
-    return () unless defined($Preexec) || @_;
+    return () unless defined($Preexec) || @cmd_list;
 
     # duplicate stdin to be restored later
     my $ORIGSTDIN;
-    open($ORIGSTDIN, "<&=" . fileno(*STDIN))
-        or open($ORIGSTDIN, "<&" . fileno(*STDIN)) # fallback
-        or warn("IPC::Exe::exe() cannot fdopen STDIN", "\n  ", $!)
-        and return ();
+    $non_unix
+        ? open($ORIGSTDIN, "<&=" . fileno(*STDIN))
+        : open($ORIGSTDIN, "<&"  . fileno(*STDIN))
+            or warn("IPC::Exe::exe() cannot duplicate STDIN", "\n  ", $!)
+            and return ();
 
     # safe pipe open to forked child connected to opened filehandle
     my $gotchild = _pipe_from_fork(my $EXE_READ, my $EXE_GO);
@@ -189,20 +191,24 @@ EOT
             # non-Unix: reset to default $IPC::Exe::_preexec_wait time
             local $IPC::Exe::_preexec_wait;
 
-            { @ret = $Reader->($gotchild, @_) }
+            { @ret = $Reader->($gotchild, @cmd_list) }
 
             $status_reader = $?;
         }
         elsif (!$opt{stdout})
         {
             # default READER just prints stdin
-            print while <$EXE_READ>;
+            while (my $read = <$EXE_READ>)
+            {
+                print $read;
+            }
         }
 
         # restore stdin
-        open(*STDIN, "<&=" . fileno($ORIGSTDIN))
-            or open(*STDIN, "<&" . fileno($ORIGSTDIN)) # fallback
-            or die("IPC::Exe::exe() cannot restore STDIN", "\n  ", $!);
+        $non_unix
+            ? open(*STDIN, "<&=" . fileno($ORIGSTDIN))
+            : open(*STDIN, "<&"  . fileno($ORIGSTDIN))
+                or die("IPC::Exe::exe() cannot restore STDIN", "\n  ", $!);
 
         # non-blocking wait for interactive children
         my $reap = waitpid($gotchild, $IPC::Exe::_stdin ? WNOHANG : 0);
@@ -214,7 +220,7 @@ EOT
         if (!$Reader && !$opt{stdout})
         {
             $ret[0] = $status;
-            close($EXE_READ);
+            close($PIPE);
         }
 
         my $ret_pid = 1;
@@ -304,7 +310,7 @@ EOT
         select((select(*STDOUT), $| = ($|++, print "")[0])[0]) if _is_fh(*STDOUT);
 
         # only exec() LIST if defined
-        unless (@_)
+        unless (@cmd_list)
         {
             # non-Unix: signal parent "process" to restore filehandles
             if ($non_unix && _is_fh($EXE_GO))
@@ -376,9 +382,12 @@ EOT
                       ? map {
                             (my $x = $_)
                                 =~ s/(\\"|")/$1 eq '"' ? '\\"' : '\\\\\\"'/ge;
-                            qq("$x");
-                        } @_
-                      : @_;
+
+                            $x =~ /[\[\](){}<>'"`~!@^&+=|;,\s]/
+                                ? qq("$x")
+                                : $x;
+                        } @cmd_list
+                      : @cmd_list;
 
         # non-Unix: signal parent "process" to restore filehandles
         if ($non_unix && _is_fh($EXE_GO))
@@ -404,10 +413,7 @@ sub bg {
 
     # only consider first 2 arguments
     my @args = @_[0 .. 1];
-    return sub {
-        my @_closure = @_;
-        _bg(\@_closure, @args);
-    }
+    return sub { _bg([ @_ ], @args) };
 }
 sub _bg {
     # obtain reference to arguments passed to closure
@@ -417,14 +423,15 @@ sub _bg {
     my %opt = (
         wait => 2,
     );
-    if (_is_hash($_[0]))
+    if (_is_hash(my $opt_ref = $_[0]))
     {
-        @opt{keys %{ $_[0] }} = values %{ $_[0] };
+        @opt{keys %{ $opt_ref }} = values %{ $opt_ref };
         shift();
     }
 
     # obtain CODE reference for BACKGROUND subroutine
-    my $Background = shift() if _is_code($_[0]);
+    my $code_ref;
+    my $Background = shift() if _is_code($code_ref = $_[0]);
 
     # do not continue if no BACKGROUND found
     return () unless defined($Background);
@@ -517,7 +524,7 @@ EOT
             if ($defined_child)
             {
                 # child writes grandchild's PID to parent process
-                print "$gotgrand\n";
+                print { *STDOUT } "$gotgrand\n";
             }
             else
             {
