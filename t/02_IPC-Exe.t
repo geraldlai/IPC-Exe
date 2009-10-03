@@ -24,7 +24,7 @@ BEGIN {
 
 my $DEBUG = 0;
 
-BEGIN { plan tests => 70 }
+BEGIN { plan tests => 71 }
 #BEGIN { plan "no_plan" }
 
 # can we use the module?
@@ -227,7 +227,7 @@ SKIP: {
 
 # quoting
 {
-    my @pids = &{
+    my @pids1 = &{
         exe $^X, '-e', 'print " \"\t\\\\\n"',
         sub {
             timeout {
@@ -237,7 +237,17 @@ SKIP: {
         },
     };
 
-    diag Dumper(\@pids) if $DEBUG;
+    my @pids2 = &{
+        exe $^X, '-le', 'print scalar grep { $_ eq "" } @ARGV', '', '',
+        sub {
+            timeout {
+                chomp(my $result = <STDIN>);
+                is($result, 2, $_[0]);
+            } "quoting: empty arguments";
+        },
+    };
+
+    diag Dumper(\@pids1, \@pids2) if $DEBUG;
 }
 
 # arguments to &PREEXEC and &READER

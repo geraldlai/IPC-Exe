@@ -12,11 +12,10 @@ BEGIN {
     require Exporter;
     *import = \&Exporter::import; # just inherit import() only
 
-    our $VERSION   = 1.008;
+    our $VERSION   = 1.009;
     our @EXPORT_OK = qw(&exe &bg);
 }
 
-use POSIX qw(WNOHANG);
 use File::Spec qw();
 use Time::HiRes qw(usleep);
 
@@ -42,6 +41,20 @@ sub _quit {
     my $status = shift() || 0;
     threads->exit($status) if threads->can("exit");
     exit($status);
+}
+
+# escape LIST to be passed to exec() in a portable way
+sub _escape_cmd_list {
+    return $non_unix
+        ? map {
+              (my $x = $_)
+                  =~ s/(\\"|")/$1 eq '"' ? '\\"' : '\\\\\\"'/ge;
+
+              $x =~ /[\[\](){}<>'"`~!@^&+=|;,\s]/
+                  ? qq("$x")
+                  : $x;
+          } @_
+        : @_;
 }
 
 # closure allows exe() to do its magical arguments arrangement
@@ -210,9 +223,13 @@ EOT
             : open(*STDIN, "<&"  . fileno($ORIGSTDIN))
                 or die("IPC::Exe::exe() cannot restore STDIN", "\n  ", $!);
 
-        # non-blocking wait for interactive children
-        my $reap = waitpid($gotchild, $IPC::Exe::_stdin ? WNOHANG : 0);
-        my $status = $?;
+        # do not wait for interactive children
+        my ($reap, $status) = (0, 0);
+        unless ($IPC::Exe::_stdin || $opt{stdout} || $opt{stderr})
+        {
+            $reap = waitpid($gotchild, 0);
+            $status = $?;
+        }
 
         #print STDERR "reap> $gotchild : $reap | $status\n";
 
@@ -378,16 +395,7 @@ EOT
         }
 
         # non-Unix: escape command so that it feels Unix-like
-        my @cmd = $non_unix
-                      ? map {
-                            (my $x = $_)
-                                =~ s/(\\"|")/$1 eq '"' ? '\\"' : '\\\\\\"'/ge;
-
-                            $x =~ /[\[\](){}<>'"`~!@^&+=|;,\s]/
-                                ? qq("$x")
-                                : $x;
-                        } @cmd_list
-                      : @cmd_list;
+        my @cmd = _escape_cmd_list(@cmd_list);
 
         # non-Unix: signal parent "process" to restore filehandles
         if ($non_unix && _is_fh($EXE_GO))
@@ -958,23 +966,23 @@ Optionally, C<&PREEXEC> could return a LIST of strings to perform common filehan
   "1>&2" or ">&2"      redirect stdout to  stderr
   "1><2"               swap     stdout and stderr
 
-  "0:crlf"             does binmode(STDIN, ":crlf");
+  "0:crlf"             does binmode(STDIN,  ":crlf");
   "1:raw" or "1:"      does binmode(STDOUT, ":raw");
   "2:utf8"             does binmode(STDERR, ":utf8");
+
+It is important to note that the actions & return of C<&PREEXEC> matters, as it may be used to redirect filehandles before C<&PREEXEC> becomes the exec process.
+
+C<&PREEXEC> is called with arguments passed to the CODE reference returned by C<exe( )>.
 
 C<&READER> is called with C<($child_pid, LIST)> as its arguments. C<LIST> corresponds to the positional arguments passed in-between C<&PREEXEC> and C<&READER>.
 
 If C<exe( )>'s are chained, C<&READER> calls itself as the next C<exe( )> in line, which in turn, calls the next C<&PREEXEC>, C<LIST>, etc.
-
-C<&PREEXEC> is called with arguments passed to the CODE reference returned by C<exe( )>.
 
 C<&READER> is always called in the parent process.
 
 C<&PREEXEC> is always called in the child process.
 
 C<&PREEXEC> and C<&READER> are very similar and may be treated the same.
-
-It is important to note that the actions & return of C<&PREEXEC> matters, as it may be used to redirect filehandles before C<&PREEXEC> becomes the exec process.
 
 C<waitpid( $_[0], 0 )> in C<&READER> to set exit status C<$?> of previous process executing on the pipe. C<close( $IPC::Exe::PIPE )> can also be used to close the input filehandle and set C<$?> at the same time (for Unix platforms only).
 
@@ -1283,10 +1291,6 @@ The following modules are required:
 =item *
 
 L<Exporter> [core module]
-
-=item *
-
-L<POSIX> [core module]
 
 =item *
 

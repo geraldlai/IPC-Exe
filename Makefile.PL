@@ -17,7 +17,6 @@ WriteMakefile(
 
     ## DEPENDENCIES ##
     PREREQ_PM => {
-                     'POSIX'       => 0,
                      'File::Spec'  => 0,
                      'Time::HiRes' => 0,
                  },
