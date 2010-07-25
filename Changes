@@ -1,5 +1,10 @@
 Revision history for IPC::Exe
 
+1.010    2010/07/25
+         - Pass along $! and $^E upon each call to exe().
+           Do not modify $?, $! and $^E for bg().
+         - Hopeful robustness improvements for non-Unix.
+
 1.009    2009/10/03
          - Do not wait on child with returned STDOUT/STDERR filehandles.
          - Removed dependency on POSIX module.

@@ -24,7 +24,7 @@ BEGIN {
 
 my $DEBUG = 0;
 
-BEGIN { plan tests => 71 }
+BEGIN { plan tests => 80 }
 #BEGIN { plan "no_plan" }
 
 # can we use the module?
@@ -73,19 +73,19 @@ my $exit_loop = $non_unix ? 'last if /line[36]$/' : '';
 # create filters
 my $filt_out_1 = [
     [ $^X, '-e', 'while (<STDIN>) { print STDOUT "from_out_1> $_";' . $exit_loop . '}' ],
-    sub { "from_out_1> $_" },
+    "from_out_1> ",
 ];
 my $filt_out_2 = [
     [ $^X, '-e', 'while (<STDIN>) { print STDOUT "from_out_2> $_";' . $exit_loop . '}' ],
-    sub { "from_out_2> $_" },
+    "from_out_2> ",
 ];
 my $filt_err_1 = [
     [ $^X, '-e', 'while (<STDIN>) { print STDERR "from_err_1> $_";' . $exit_loop . '}' ],
-    sub { "from_err_1> $_" },
+    "from_err_1> ",
 ];
 my $filt_err_out = [
     [ $^X, '-e', '$| = 1; while (<STDIN>) { print STDERR "filt_err_out> $_"; print STDOUT "filt_err_out> $_";' . $exit_loop . '}' ],
-    sub { "filt_err_out> $_" },
+    "filt_err_out> ",
 ];
 
 # syntax
@@ -104,12 +104,16 @@ my $filt_err_out = [
 
 # exit status
 {
+    ($?, $!, $^E) = (55, 66, 66);
+
     my @pids1 = &{
         exe sub { "1>#" }, @{ $gen_out->[0] },
     };
 
     ok( defined($pids1[0]), "exit: gen_out pid");
     is($?        >> 8, 44,  "exit: gen_out exit status \$?");
+    is($!  + 0       , 66,  "exit: gen_out exit status \$!");
+    is($^E + 0       , 66,  "exit: gen_out exit status \$^E");
     is($pids1[1] >> 8, 44,  "exit: gen_out exit status return");
 
     my @pids2 = &{
@@ -118,20 +122,30 @@ my $filt_err_out = [
 
     ok( defined($pids2[0]), "exit: gen_err pid");
     is($?        >> 8, 77,  "exit: gen_err exit status \$?");
+    is($!  + 0       , 66,  "exit: gen_err exit status \$!");
+    is($^E + 0       , 66,  "exit: gen_out exit status \$^E");
     is($pids2[1] >> 8, 77,  "exit: gen_err exit status return");
 
     my @pids3 = &{
         exe sub { "1>#" }, @{ $gen_out->[0] },
-        sub { $? = 33 << 8 }
+        sub {
+            # avoid implicit close() that clobbers $! / $^E
+            close($IPC::Exe::PIPE);
+
+            $! = $^E = 33;
+            $? = $! << 8;
+        }
     };
 
     ok( defined($pids3[0]), "exit_fake: gen_out pid");
     is($?        >> 8, 33,  "exit_fake: exit status \$?");
+    is($!  + 0       , 33,  "exit_fake: exit status \$!");
+    is($^E + 0       , 33,  "exit_fake: exit status \$^E");
     is($pids3[1] >> 8, 33,  "exit_fake: exit status return");
 
     my @pids4 = &{
         exe sub { "1>#" }, @{ $gen_out->[0] },
-        sub { $? = 33 << 8; waitpid($_[0], 0); $? }
+        sub { $? = 22 << 8; waitpid($_[0], 0); $? }
     };
 
     ok( defined($pids4[0]), "exit_waitpid: gen_out pid");
@@ -165,7 +179,7 @@ SKIP: {
             timeout {
                 chomp(my @result = <STDIN>);
                 my @expected =
-                    @{ $gen_out->[1] };
+                  @{ $gen_out->[1] };
                 is_deeply(\@result, \@expected, $_[0]);
             } "simple: gen_out only";
         },
@@ -185,8 +199,8 @@ SKIP: {
             timeout {
                 chomp(my @result = <STDIN>);
                 my @expected =
-                    map $filt_out_1->[1]->(),
-                    @{ $gen_out->[1] };
+                  map { $filt_out_1->[1] . $_ }
+                  @{ $gen_out->[1] };
 
                 is_deeply(\@result, \@expected, $_[0]);
             } "one_filter: gen_out + filt_out_1";
@@ -209,9 +223,9 @@ SKIP: {
             timeout {
                 chomp(my @result = <STDIN>);
                 my @expected =
-                    map $filt_out_2->[1]->(),
-                    map $filt_out_1->[1]->(),
-                    @{ $gen_out->[1] };
+                  map { $filt_out_2->[1] . $_ }
+                  map { $filt_out_1->[1] . $_ }
+                  @{ $gen_out->[1] };
 
                 is_deeply(\@result, \@expected, $_[0]);
             } "two_filters: gen_out + filt_out_1 + filt_out_2";
@@ -253,20 +267,20 @@ SKIP: {
 # arguments to &PREEXEC and &READER
 {
     my $cb =
-        exe sub { print "$_\n" for @_ }, @{ $gen_out->[0] },
-        sub {
-            timeout {
-                chomp(my @result = <STDIN>);
-                my @expected = (
-                    @{ $gen_err->[1] },
-                    @{ $gen_out->[1] },
-                );
+      exe sub { print "$_\n" for @_ }, @{ $gen_out->[0] },
+      sub {
+          timeout {
+              chomp(my @result = <STDIN>);
+              my @expected = (
+                  @{ $gen_err->[1] },
+                  @{ $gen_out->[1] },
+              );
 
-                is_deeply(\@result, \@expected, $_[0]);
-            } "arguments: to &PREEXEC";
+              is_deeply(\@result, \@expected, $_[0]);
+          } "arguments: to &PREEXEC";
 
-            return [ @_ ];
-        };
+          return [ @_ ];
+      };
 
     my @pids = $cb->(@{ $gen_err->[1] });
 
@@ -301,7 +315,7 @@ SKIP: {
             timeout {
                 chomp(my @result = <STDIN>);
                 my @expected =
-                    @{ $gen_err->[1] };
+                  @{ $gen_err->[1] };
                 is_deeply(\@result, \@expected, $_[0]);
             } "redir_err2out: gen_err only";
         },
@@ -322,9 +336,9 @@ SKIP: {
             timeout {
                 chomp(my @result = <STDIN>);
                 my @expected =
-                    map $filt_out_2->[1]->(),
-                    map $filt_err_1->[1]->(),
-                    @{ $gen_err->[1] };
+                  map { $filt_out_2->[1] . $_ }
+                  map { $filt_err_1->[1] . $_ }
+                  @{ $gen_err->[1] };
                 is_deeply(\@result, \@expected, $_[0]);
             } "redir_err2out_with_filters: gen_err + filt_err_1 + filt_out_2";
         },
@@ -599,8 +613,8 @@ SKIP: {
         s/[\r\n]*\z// for @result; # chomp(@result);
 
         my @expected =
-            map $filt_err_1->[1]->(),
-            @{ $gen_out->[1] };
+          map { $filt_err_1->[1] . $_ }
+          @{ $gen_out->[1] };
         is_deeply(\@result, \@expected, $_[0]);
     } "interact_out: from stdout";
 
@@ -629,8 +643,8 @@ SKIP: {
         s/[\r\n]*\z// for @result; # chomp(@result);
 
         my @expected =
-            map $filt_err_1->[1]->(),
-            @{ $gen_err->[1] };
+          map { $filt_err_1->[1] . $_ }
+          @{ $gen_err->[1] };
         is_deeply(\@result, \@expected, $_[0]);
     } "interact_err: from stderr";
 
@@ -655,9 +669,9 @@ SKIP: {
     print $TO_STDIN "$_\n" for qw(line1 line2 line3);
 
     my @expected =
-        map $filt_err_out->[1]->(),
-        map $filt_err_1->[1]->(),
-        @{ $gen_out->[1] };
+      map { $filt_err_out->[1] . $_ }
+      map { $filt_err_1->[1] . $_ }
+      @{ $gen_out->[1] };
 
     timeout {
         my @result_out;
@@ -684,7 +698,9 @@ SKIP: {
 
 # background
 SKIP: {
-    skip("- background: only available in DEBUG mode", 1) unless $DEBUG;
+    skip("- background: only available in DEBUG mode", 4) unless $DEBUG;
+
+    ($?, $!, $^E) = (55, 66, 66);
 
     # this is touchy - may fail sporadically depending on system load
     # time is not enough for exe() to complete
@@ -693,5 +709,10 @@ SKIP: {
         &{ bg exe $^X, '-e', 'sleep 1', };
         pass($_[0]);
     } "background", 50e-3;
+
+    # error variables are untouched
+    is($?     , 55, "bg_no_exit: exit status \$?");
+    is($!  + 0, 66, "bg_no_exit: exit status \$!");
+    is($^E + 0, 66, "bg_no_exit: exit status \$^E");
 }
 
