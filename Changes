@@ -1,5 +1,18 @@
 Revision history for IPC::Exe
 
+2.001001  2011/10/22
+          + Able to pass scalar references to \%EXE_OPTIONS for 'pid', 'stdin',
+            'stdout', and 'stderr' options. Each referenced scalar will be
+            assigned its corresponding value and will not be returned by exe().
+          + &PREEXEC can return array references to perform open().
+            If references to array refs are returned, perform sysopen() instead.
+          + Added taint checking.
+          + Raised minimum Perl version required to v5.8.8.
+            This is for better handling of filehandles and PerlIO layers.
+          + Changed release to semantic versioning.
+          - Pass along $@ upon each call to exe().
+            Do not modify $@ for bg().
+
 1.010    2010/07/25
          - Pass along $! and $^E upon each call to exe().
            Do not modify $?, $! and $^E for bg().

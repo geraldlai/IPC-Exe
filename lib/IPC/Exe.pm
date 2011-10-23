@@ -1,6 +1,6 @@
 package IPC::Exe;
 
-use 5.006_000;
+use 5.008_008;
 
 use warnings;
 use strict;
@@ -10,31 +10,41 @@ no warnings qw(internal);
 
 BEGIN {
     require Exporter;
-    *import = \&Exporter::import; # just inherit import() only
+    *import = \&Exporter::import;
 
-    our $VERSION   = "1.010";
+    our $VERSION   = "2.001001";
     our @EXPORT_OK = qw(exe bg);
 }
 
-use File::Spec qw();
+use Carp qw(carp croak);
+use Data::Dumper qw(Dumper);
+use File::Spec ();
+use Scalar::Util qw(tainted);
 use Time::HiRes qw(usleep);
 
-# define null device
-my $DEVNULL = File::Spec->devnull();
+++$Carp::Internal{$_} for __PACKAGE__;
 
-# define non-Unix platforms
-my $non_unix = ($^O =~ /^(?:MSWin32|os2)$/);
+use constant NON_UNIX => ($^O =~ /^(?:MSWin32|os2)$/);
 
-# bg() fallback to forked child/parent process to ensure execution
-our $bg_fallback = 0;
+# default environment variables to check for taint
+our @TAINT_ENV = qw(PATH PATHEXT IFS CDPATH ENV BASH_ENV PERL5SHELL);
 
-# create package-scope $IPC::Exe::is_forked
 our $is_forked = 0;
 
-# check ref type
-sub _is_hash { ref($_[0]) && eval { %{ $_[0] } or 1 } }
-sub _is_code { UNIVERSAL::isa($_[0], "CODE") }
-sub _is_fh   { eval { defined(fileno($_[0])) } }
+# if set, fallback to forked child/parent process to ensure execution
+our $bg_fallback = 0;
+
+my $DEVNULL = File::Spec->devnull();
+
+sub _reftype { Scalar::Util::reftype($_[0]) || "" }
+sub _is_fh { eval { defined(fileno($_[0])) } }
+
+sub _stringify_args {
+    local $Data::Dumper::Indent = 0;
+    local $Data::Dumper::Useqq  = 1;
+    local $Data::Dumper::Terse  = 1;
+    return join(", " => map { Dumper($_) } @_);
+}
 
 # exit thread/process
 sub _quit {
@@ -48,10 +58,10 @@ sub _quit {
 
 # escape LIST to be passed to exec() in a portable way
 sub _escape_cmd_list {
-    return $non_unix
+    return NON_UNIX
       ? map {
             (my $x = $_)
-                =~ s/(\\"|")/$1 eq '"' ? '\\"' : '\\\\\\"'/ge;
+              =~ s/(\\"|")/$1 eq '"' ? '\\"' : '\\\\\\"'/ge;
 
             $x =~ /[\[\](){}<>'"`~!@^&+=|;,\s]/
               ? qq("$x")
@@ -60,62 +70,80 @@ sub _escape_cmd_list {
       : @_;
 }
 
-# closure allows exe() to do its magical arguments arrangement
-sub exe {
-    # return empty list if no arguments
-    return () if @_ == 0;
+sub _check_taint {
+    my (@bad_args, @bad_env);
 
-    # return only single CODE argument
-    #   e.g. exe sub { .. };
-    #          returns
-    #        sub { .. }
-    my ($code) = @_;
-    if (@_ == 1 && _is_code($code))
+    my $i = -1;
+    for my $v (@_)
     {
-        return $code;
+        ++$i;
+        push(@bad_args, [ $v, $i ]) if tainted($v);
+    }
+    for my $v (@TAINT_ENV)
+    {
+        push(@bad_env, $v) if tainted($ENV{$v});
     }
 
-    # otherwise return closure
-    my @args = @_;
-    return sub { _exe(@_ ? [ @_ ] : undef, @args) };
+    # die if environment / arguments are tainted
+    if (@bad_args || @bad_env)
+    {
+        croak("IPC::Exe::exe() called with tainted vars:\n  ",
+            join("\n  " => map { "\$ENV{$_}" } @bad_env), "\n  ",
+            join("\n  " => map { "<$_->[0]> at index $_->[1]" } @bad_args), "\n",
+        );
+    }
+
+    return;
+}
+
+sub exe {
+    _check_taint(@_) if $] >= 5.008 && ${^TAINT};
+
+    return () if @_ == 0;
+
+    # exe(sub { .. }) returns (sub { .. }) itself
+    return $_[0] if @_ == 1 && _reftype($_[0]) eq "CODE";
+
+    my $args = \@_;
+    return sub { _exe(@_ ? [ @_ ] : undef, @{ $args }) };
 }
 sub _exe {
     # record error variables
-    my @status = ($?, -+-$!, -+-$^E);
+    my @status = ($?, -+-$!, -+-$^E, $@);
 
-    # obtain reference to arguments passed to closure
-    my $_closure = shift;
+    # ref to arguments passed to closure
+    my $_args = shift;
 
     # merge options hash reference, if available
     my %opt = (
+        pid        => undef,
         stdin      => 0,
         stdout     => 0,
         stderr     => 0,
         autoflush  => 1,
         binmode_io => undef,
     );
-    if (_is_hash(my $opt_ref = $_[0]))
+    my $opt_ref = $_[0];
+    if (_reftype($opt_ref) eq "HASH")
     {
         @opt{keys %{ $opt_ref }} = values %{ $opt_ref };
         shift;
     }
 
     # propagate $opt{binmode_io} to set binmode down chain of executions
-    my $binmode_io = defined($opt{binmode_io})
+    local $IPC::Exe::_binmode_io = defined($opt{binmode_io})
       ? $opt{binmode_io}
       : $IPC::Exe::_binmode_io;
-    local $IPC::Exe::_binmode_io = $binmode_io;
 
     # propagate $opt{stdin} down chain of executions
-    my $stdin = $IPC::Exe::_stdin || $opt{stdin};
-    local $IPC::Exe::_stdin = $stdin;
+    local $IPC::Exe::_stdin = $IPC::Exe::_stdin || !(!$opt{stdin});
 
     # setup input filehandle to write to STDIN
     my ($FOR_STDIN, $TO_STDIN);
     if ($opt{stdin})
     {
         pipe($FOR_STDIN, $TO_STDIN)
-          or warn("IPC::Exe::exe() cannot create pipe to STDIN", "\n  ", $!)
+          or carp("IPC::Exe::exe() cannot create pipe to STDIN", "\n  ", $!)
           and return ();
 
         # make filehandle hot
@@ -127,7 +155,7 @@ sub _exe {
     if ($opt{stderr})
     {
         pipe($FROM_STDERR, $BY_STDERR)
-          or warn("IPC::Exe::exe() cannot create pipe from STDERR", "\n  ", $!)
+          or carp("IPC::Exe::exe() cannot create pipe from STDERR", "\n  ", $!)
           and return ();
 
         # make filehandle hot
@@ -135,17 +163,18 @@ sub _exe {
     }
 
     # obtain CODE references, if available, for READER & PREEXEC subroutines
-    my $Preexec = shift if _is_code($_[0]);
-    my $Reader  =   pop if _is_code($_[-1]);
+    my ($Preexec, $Reader);
+    $Preexec = shift if _reftype($_[0])  eq "CODE";
+    $Reader  =   pop if _reftype($_[-1]) eq "CODE";
 
     # what is left is the command LIST
     my @cmd_list = @_;
 
-    # check for undefined values in LIST
-    if (grep { !defined() } @cmd_list)
+    # ban undefined values in LIST
+    if (grep { !defined($_) } @cmd_list)
     {
-        warn("IPC::Exe::exe() cannot execute undef argument(s) below:", "\n  ",
-          join(" " => map { defined() ? "<$_>" : "[undef]" } @cmd_list), "\n");
+        carp("IPC::Exe::exe() cannot execute undef argument(s) below:", "\n  ",
+          _stringify_args(@cmd_list), "\n");
         return ();
     }
 
@@ -154,11 +183,11 @@ sub _exe {
 
     # duplicate stdin to be restored later
     my $ORIGSTDIN;
-    $non_unix
-      ? open($ORIGSTDIN, "<&=" . fileno(*STDIN))
-      : open($ORIGSTDIN, "<&"  . fileno(*STDIN))
-          or warn("IPC::Exe::exe() cannot duplicate STDIN", "\n  ", $!)
-          and return ();
+    NON_UNIX
+      ? open($ORIGSTDIN, "<&=STDIN")
+      : open($ORIGSTDIN, "<&STDIN")
+      or carp("IPC::Exe::exe() cannot dup STDIN", "\n  ", $!)
+      and return ();
 
     # safe pipe open to forked child connected to opened filehandle
     my $gotchild = _pipe_from_fork(my $EXE_READ, my $EXE_GO);
@@ -167,14 +196,15 @@ sub _exe {
     # check if fork was successful
     unless ($defined_child)
     {
-        warn("IPC::Exe::exe() cannot fork child", "\n  ", $!);
+        carp("IPC::Exe::exe() cannot fork child", "\n  ", $!);
         return ();
     }
 
     # parent reads stdout of child process
     if ($gotchild)
     {
-        # close unneeded filehandles
+        # unneeded stuff
+        undef $_ for $Preexec, $_args;
         close($FOR_STDIN) if $FOR_STDIN;
         close($BY_STDERR) if $BY_STDERR;
 
@@ -186,21 +216,21 @@ sub _exe {
 
             if ($opt{stdin})
             {
-                binmode($TO_STDIN, $layer) or die(<<"EOT", "  ", $!);
+                binmode($TO_STDIN, $layer) or croak(<<"EOT", "  ", $!);
 IPC::Exe::exe() cannot set binmode STDIN_WRITEHANDLE for layer "$layer"
 EOT
             }
 
-            binmode($EXE_READ, $layer) or die(<<"EOT", "  ", $!);
+            binmode($EXE_READ, $layer) or croak(<<"EOT", "  ", $!);
 IPC::Exe::exe() cannot set binmode STDOUT_READHANDLE for layer "$layer"
 EOT
         }
 
         # temporarily replace stdin
         $IPC::Exe::_stdin
-          ? open(*STDIN, "<&=" . fileno($EXE_READ))
-          : open(*STDIN, "<&"  . fileno($EXE_READ))
-              or die("IPC::Exe::exe() cannot replace STDIN", "\n  ", $!);
+          ? open(*STDIN, "<&=", $EXE_READ)
+          : open(*STDIN, "<&",  $EXE_READ)
+              or croak("IPC::Exe::exe() cannot replace STDIN", "\n  ", $!);
 
         # create local package-scope $IPC::Exe::PIPE
         local our $PIPE = $EXE_READ;
@@ -215,7 +245,8 @@ EOT
 
             { @ret = $Reader->($gotchild, @cmd_list) }
 
-            @status_reader = ($?, -+-$!, -+-$^E);
+            @status_reader = ($?, -+-$!, -+-$^E, $@);
+            undef $PIPE;
         }
         elsif (!$opt{stdout})
         {
@@ -227,10 +258,10 @@ EOT
         }
 
         # restore stdin
-        $non_unix
-          ? open(*STDIN, "<&=" . fileno($ORIGSTDIN))
-          : open(*STDIN, "<&"  . fileno($ORIGSTDIN))
-              or die("IPC::Exe::exe() cannot restore STDIN", "\n  ", $!);
+        NON_UNIX
+          ? open(*STDIN, "<&=", $ORIGSTDIN)
+          : open(*STDIN, "<&",  $ORIGSTDIN)
+          or croak("IPC::Exe::exe() cannot restore STDIN", "\n  ", $!);
 
         # do not wait for interactive children
         my $reap = 0;
@@ -249,7 +280,7 @@ EOT
             close($EXE_READ);
         }
 
-        my $ret_pid = 1;
+        my $ret_pid = $gotchild;
 
         # reading from failed exec
         if ($status[0] == -1 || $status[0] == 255 << 8) # 255 (assumed as failed exec)
@@ -258,7 +289,7 @@ EOT
             # if using default &READER, additionally check if we reaped -1
             #   and return -1 since it looks like a failed exec
 
-            $ret_pid = 0
+            $ret_pid = undef
               if (!$Reader && !$opt{stdout} # using default &READER
                 && ($reap == $gotchild || $reap == -1 || $reap == 0)
                 && ($ret[0] = -1)) # return -1
@@ -272,16 +303,24 @@ EOT
             $ret[0] = undef;
         }
 
+        # assign scalar references if provided
+        ${ $opt{pid} }    = $ret_pid     if _reftype($opt{pid})    eq "SCALAR";
+        ${ $opt{stdin} }  = $TO_STDIN    if _reftype($opt{stdin})  eq "SCALAR";
+        ${ $opt{stdout} } = $EXE_READ    if _reftype($opt{stdout}) eq "SCALAR";
+        ${ $opt{stderr} } = $FROM_STDERR if _reftype($opt{stderr}) eq "SCALAR";
+
         # collect child PIDs & filehandle(s)
         unshift(@ret,
-            $ret_pid     ? $gotchild : undef,
-            $opt{stdin}  ? $TO_STDIN    : (),
-            $opt{stdout} ? $EXE_READ    : (),
-            $opt{stderr} ? $FROM_STDERR : (),
+                            _reftype($opt{pid})    ne "SCALAR" ? $ret_pid     : (),
+            $opt{stdin}  && _reftype($opt{stdin})  ne "SCALAR" ? $TO_STDIN    : (),
+            $opt{stdout} && _reftype($opt{stdout}) ne "SCALAR" ? $EXE_READ    : (),
+            $opt{stderr} && _reftype($opt{stderr}) ne "SCALAR" ? $FROM_STDERR : (),
         );
 
         # restore exit status
-        ($?, $!, $^E) = @status_reader ? @status_reader : @status;
+        ($?, $!, $^E, $@) = @status_reader ? @status_reader : @status;
+
+        undef $Reader;
 
         return @ret[0 .. $#ret]; # return LIST instead of ARRAY
     }
@@ -295,22 +334,23 @@ EOT
         untie(*STDOUT);
         untie(*STDERR);
 
-        # close unneeded filehandles
+        # unneeded stuff
+        undef $Reader;
         close($TO_STDIN)    if $TO_STDIN;
         close($FROM_STDERR) if $FROM_STDERR;
 
         # change STDIN if input filehandle was required
         if ($FOR_STDIN)
         {
-            open(*STDIN, "<&" . fileno($FOR_STDIN))
-              or die("IPC::Exe::exe() cannot change STDIN", "\n  ", $!);
+            open(*STDIN, "<&=", $FOR_STDIN)
+              or croak("IPC::Exe::exe() cannot change STDIN", "\n  ", $!);
         }
 
         # collect STDERR if error filehandle was required
         if ($BY_STDERR)
         {
-            open(*STDERR, ">&" . fileno($BY_STDERR))
-              or die("IPC::Exe::exe() cannot collect STDERR", "\n  ", $!);
+            open(*STDERR, ">&=", $BY_STDERR)
+              or croak("IPC::Exe::exe() cannot collect STDERR", "\n  ", $!);
         }
 
         # set binmode if required
@@ -320,7 +360,7 @@ EOT
             my $layer = $IPC::Exe::_binmode_io;
 
             binmode(*STDIN, $layer) and binmode(*STDOUT, $layer)
-              or die(<<"EOT", "  ", $!);
+              or croak(<<"EOT", "  ", $!);
 IPC::Exe::exe() cannot set binmode STDIN and STDOUT for layer "$layer"
 EOT
         }
@@ -329,7 +369,8 @@ EOT
         my @FHop;
         if ($Preexec)
         {
-            { @FHop = $Preexec->($_closure ? @{ $_closure } : ()) }
+            { @FHop = $Preexec->($_args ? @{ $_args } : ()) }
+            undef $_ for $Preexec, $_args;
         }
 
         # manually flush STDERR and STDOUT
@@ -340,7 +381,7 @@ EOT
         unless (@cmd_list)
         {
             # non-Unix: signal parent "process" to restore filehandles
-            if ($non_unix && _is_fh($EXE_GO))
+            if (NON_UNIX && _is_fh($EXE_GO))
             {
                 print $EXE_GO "exe_no_exec\n";
                 close($EXE_GO);
@@ -352,29 +393,88 @@ EOT
         # perform redirections
         for (@FHop)
         {
-            next unless defined() && !ref();
+            next unless defined($_);
+
+            if (ref($_))
+            {
+                my $is_sysopen = 0;
+                $_ = ${ $_ } and ++$is_sysopen
+                  if _reftype($_) eq "REF";
+
+                # open / sysopen
+                if (_reftype($_) eq "ARRAY")
+                {
+                    my @args = @{ $_ };
+                    my ($fh_name, $fh_num, $op);
+
+                    unless ($is_sysopen)
+                    {
+                        ($fh_num, $op) = ($args[0] =~ /^([012]?)(\+?[<>].*)/)
+                          if defined($args[0]);
+
+                        if (defined($op))
+                        {
+                            $fh_num = index($op, ">") == -1 ? 0
+                              : !$fh_num ? 1
+                              : $fh_num + 0;
+                            $fh_name = qw(STDIN STDOUT STDERR)[$fh_num];
+                            shift @args;
+                            unshift @args, (*STDIN, *STDOUT, *STDERR)[$fh_num], $op;
+                        }
+                    }
+
+                    my $error_msg =
+                      "IPC::Exe::exe() failed to "
+                      . ($is_sysopen ? "sysopen" : "open") . "( "
+                      . ($fh_name ? "$fh_name, " : "")
+                      . _stringify_args(
+                          $fh_name ? () : $args[0],
+                          @args[1 .. $#args],
+                      ) . " )";
+
+                    croak($error_msg, "\n  ", $! = 22)
+                      if $is_sysopen
+                        ? (@args < 3 || @args > 4)
+                        : (@args == 0);
+
+                    $is_sysopen
+                      ? (@args == 4
+                          ? sysopen($args[0], $args[1], $args[2], $args[3])
+                          : sysopen($args[0], $args[1], $args[2])
+                        )
+                      : open(
+                            $args[0],
+                            @args >= 2 ? $args[1] : (),
+                            @args >= 3 ? $args[2] : (),
+                            @args[3 .. $#args],
+                        )
+                          or croak($error_msg, "\n  ", $!);
+                }
+
+                next;
+            }
 
             # silence stderr
             /^\s*2>\s*(?:null|#)\s*$/  and open(*STDERR, ">", $DEVNULL)
-            || die(<<"EOT", "  ", $!);
+            || croak(<<"EOT", "  ", $!);
 IPC::Exe::exe() cannot silence STDERR (does $DEVNULL exist?)
 EOT
 
             # silence stdout
             /^\s*1?>\s*(?:null|#)\s*$/ and open(*STDOUT, ">", $DEVNULL)
-            || die(<<"EOT", "  ", $!);
+            || croak(<<"EOT", "  ", $!);
 IPC::Exe::exe() cannot silence STDOUT (does $DEVNULL exist?)
 EOT
 
             # redirect stderr to stdout
-            /^\s*2>&\s*1\s*$/          and open(*STDERR, ">&" . fileno(*STDOUT))
-            || die(<<"EOT", "  ", $!);
+            /^\s*2>&\s*1\s*$/          and open(*STDERR, ">&STDOUT")
+            || croak(<<"EOT", "  ", $!);
 IPC::Exe::exe() cannot redirect STDERR to STDOUT
 EOT
 
             # redirect stdout to stderr
-            /^\s*1?>&\s*2\s*$/         and open(*STDOUT, ">&" . fileno(*STDERR))
-            || die(<<"EOT", "  ", $!);
+            /^\s*1?>&\s*2\s*$/         and open(*STDOUT, ">&STDERR")
+            || croak(<<"EOT", "  ", $!);
 IPC::Exe::exe() cannot redirect STDOUT to STDERR
 EOT
 
@@ -382,10 +482,10 @@ EOT
             if (/^\s*(?:1><2|2><1)\s*$/)
             {
                 my $SWAP;
-                open($SWAP, ">&" . fileno(*STDOUT))
-                  and open(*STDOUT, ">&" . fileno(*STDERR))
-                  and open(*STDERR, ">&" . fileno($SWAP))
-                  or die(<<"EOT", "  ", $!);
+                open($SWAP, ">&STDOUT")
+                  and open(*STDOUT, ">&STDERR")
+                  and open(*STDERR, ">&=", $SWAP)
+                  or croak(<<"EOT", "  ", $!);
 IPC::Exe::exe() cannot swap STDOUT and STDERR
 EOT
             }
@@ -398,15 +498,11 @@ EOT
                 $layer = ":raw" if $layer eq ":";
 
                 binmode((*STDIN, *STDOUT, *STDERR)[$1], $layer)
-                  or die(<<"EOT", "  ", $!);
+                  or croak(<<"EOT", "  ", $!);
 IPC::Exe::exe() cannot set binmode $fh_name for layer "$layer"
 EOT
             }
         }
-
-        # make filehandles hot
-        select((select(*STDOUT), $| = 1)[0]) if $non_unix;
-        select((select(*STDERR), $| = 1)[0]);
 
         no warnings qw(exec);
 
@@ -414,45 +510,44 @@ EOT
         my @cmd = _escape_cmd_list(@cmd_list);
 
         # non-Unix: signal parent "process" to restore filehandles
-        my $restore_fh = ($non_unix && _is_fh($EXE_GO));
+        my $restore_fh = (NON_UNIX && _is_fh($EXE_GO));
 
         # assume exit status 255 indicates failed exec
         ($restore_fh ? print $EXE_GO "exe_with_exec\n" : 1)
           and exec { $cmd[0] } @cmd
-          or warn("IPC::Exe::exe() failed to exec the command below", " - ", $!, "\n  ",
-               join(" " => map { "<$_>" } @cmd), "\n")
+          or carp("IPC::Exe::exe() failed to exec the command below", " - ", $!, "\n  ",
+               _stringify_args(@cmd), "\n")
           and _quit(-1);
     }
 }
 
-# closure allows bg() to do its magical call placement
 sub bg {
-    # return empty list if no arguments
     return () if @_ == 0;
 
-    # only consider first 2 arguments
-    my @args = @_[0 .. 1];
-    return sub { _bg(@_ ? [ @_ ] : undef, @args) };
+    my $args = \@_;
+    return sub { _bg(@_ ? [ @_ ] : undef, @{ $args }) };
 }
 sub _bg {
     # localize error variables
-    local ($?, $!, $^E);
+    local ($?, $!, $^E, $@);
 
-    # obtain reference to arguments passed to closure
-    my $_closure = shift;
+    # ref to arguments passed to closure
+    my $_args = shift;
 
     # merge options hash reference, if available
     my %opt = (
         wait => 2,
     );
-    if (_is_hash(my $opt_ref = $_[0]))
+    my $opt_ref = $_[0];
+    if (_reftype($opt_ref) eq "HASH")
     {
         @opt{keys %{ $opt_ref }} = values %{ $opt_ref };
         shift;
     }
 
-    # obtain CODE reference for BACKGROUND subroutine
-    my $Background = shift if _is_code($_[0]);
+    # CODE reference for BACKGROUND subroutine
+    my $Background;
+    $Background = shift if _reftype($_[0]) eq "CODE";
 
     # do not continue if no BACKGROUND found
     return () unless defined($Background);
@@ -466,10 +561,9 @@ sub _bg {
 
     # dup(2) stdout
     my $ORIGSTDOUT;
-    open($ORIGSTDOUT, ">&" . fileno(*STDOUT))
-      or warn("IPC::Exe::bg() cannot dup(2) STDOUT", "\n  ", $!)
+    open($ORIGSTDOUT, ">&STDOUT")
+      or carp("IPC::Exe::bg() cannot dup STDOUT", "\n  ", $!)
       and return ();
-    select((select($ORIGSTDOUT), $| = 1)[0]) if $non_unix;
 
     # double fork -- immediately wait() for child,
     #       and init daemon will wait() for grandchild, once child exits
@@ -481,14 +575,13 @@ sub _bg {
     # check if fork was successful
     unless ($defined_child)
     {
-        # decide whether bg() should fallback upon unsuccessful forks
         if ($bg_fallback)
         {
-            warn("IPC::Exe::bg() cannot fork child, will try fork again", "\n  ", $!);
+            carp("IPC::Exe::bg() cannot fork child, will try fork again", "\n  ", $!);
         }
         else
         {
-            warn("IPC::Exe::bg() cannot fork child", "\n  ", $!) and return ();
+            carp("IPC::Exe::bg() cannot fork child", "\n  ", $!) and return ();
         }
     }
 
@@ -506,7 +599,7 @@ sub _bg {
     else
     {
         # background: perform second fork
-        my $gotgrand = $non_unix
+        my $gotgrand = NON_UNIX
           ? _pipe_from_fork(my $DUMMY, my $BG_GO2)
           : fork();
         my $defined_grand = defined($gotgrand);
@@ -514,7 +607,7 @@ sub _bg {
         # check if second fork was successful
         if ($defined_child)
         {
-            $defined_grand or warn(<<"EOT", "  ", $!);
+            $defined_grand or carp(<<"EOT", "  ", $!);
 IPC::Exe::bg() cannot fork grandchild, using child instead
  -> parent must wait
 EOT
@@ -523,14 +616,14 @@ EOT
         {
             if ($defined_grand)
             {
-                $gotgrand and warn(<<"EOT", "  ", $!);
+                $gotgrand and carp(<<"EOT", "  ", $!);
 IPC::Exe::bg() managed to fork child, using child now
  -> parent must wait
 EOT
             }
             else
             {
-                warn(<<"EOT", "  ", $!);
+                carp(<<"EOT", "  ", $!);
 IPC::Exe::bg() cannot fork child again, using parent instead
  -> parent does all the work
 EOT
@@ -566,12 +659,11 @@ EOT
             untie(*STDERR);
 
             # restore stdout
-            open(*STDOUT, ">&" . fileno($ORIGSTDOUT))
-              or die("IPC::Exe::bg() cannot restore STDOUT", "\n  ", $!);
-            select((select(*STDOUT), $| = 1)[0]) if $non_unix;
+            open(*STDOUT, ">&=", $ORIGSTDOUT)
+              or croak("IPC::Exe::bg() cannot restore STDOUT", "\n  ", $!);
 
             # non-Unix: signal parent/child "process" to restore filehandles
-            if ($non_unix)
+            if (NON_UNIX)
             {
                 if (_is_fh($BG_GO2))
                 {
@@ -587,7 +679,8 @@ EOT
             }
 
             # BACKGROUND subroutine does not need to return
-            { $Background->($_closure ? @{ $_closure } : ()) }
+            { $Background->($_args ? @{ $_args } : ()) }
+            undef $_ for $Background, $_args;
         }
         elsif (!$defined_child)
         {
@@ -610,41 +703,37 @@ EOT
     }
 }
 
+# child writes while parent reads
 # simulate open(FILEHANDLE, "-|");
 # http://perldoc.perl.org/perlfork.html#CAVEATS-AND-LIMITATIONS
 sub _pipe_from_fork ($$) {
-    # child writes while parent reads
-    my ($pid, $WRITE, $READY);
+    my $pid;
 
     # cannot fork on these platforms
     return undef if $^O =~ /^(?:VMS|dos|MacOS|riscos|amigaos|vmesa)$/;
 
-    # handle non-Unix platforms
-    if ($non_unix)
+    if (NON_UNIX)
     {
         # dup(2) stdin/stdout/stderr to be restored later
         my ($ORIGSTDIN, $ORIGSTDOUT, $ORIGSTDERR);
 
-        open($ORIGSTDIN, "<&" . fileno(*STDIN))
-          or warn("IPC::Exe cannot dup(2) STDIN", "\n  ", $!)
+        open($ORIGSTDIN,  "<&STDIN")
+          or carp("IPC::Exe cannot dup STDIN",  "\n  ", $!)
           and return undef;
 
-        open($ORIGSTDOUT, ">&" . fileno(*STDOUT))
-          or warn("IPC::Exe cannot dup(2) STDOUT", "\n  ", $!)
+        open($ORIGSTDOUT, ">&STDOUT")
+          or carp("IPC::Exe cannot dup STDOUT", "\n  ", $!)
           and return undef;
-        select((select($ORIGSTDOUT), $| = 1)[0]);
 
-        open($ORIGSTDERR, ">&" . fileno(*STDERR))
-          or warn("IPC::Exe cannot dup(2) STDERR", "\n  ", $!)
+        open($ORIGSTDERR, ">&STDERR")
+          or carp("IPC::Exe cannot dup STDERR", "\n  ", $!)
           and return undef;
-        select((select($ORIGSTDERR), $| = 1)[0]);
 
         # create pipe for READHANDLE and WRITEHANDLE
-        pipe($_[0], $WRITE) or return undef;
-        select((select($WRITE), $| = 1)[0]);
+        pipe($_[0], my $WRITE) or return undef;
 
         # create pipe for READYHANDLE and GOHANDLE
-        pipe($READY, $_[1]) or return undef;
+        pipe(my $READY, $_[1]) or return undef;
         select((select($_[1]), $| = 1)[0]);
 
         # fork is emulated with threads on Win32
@@ -668,16 +757,14 @@ sub _pipe_from_fork ($$) {
                 usleep($wait * 1e6);
                 #print STDERR "wait> $wait\n";
 
-                open(*STDIN, "<&" . fileno($ORIGSTDIN))
-                  or die("IPC::Exe cannot restore STDIN", "\n  ", $!);
+                open(*STDIN,  "<&=", $ORIGSTDIN)
+                  or croak("IPC::Exe cannot restore STDIN",  "\n  ", $!);
 
-                open(*STDOUT, ">&" . fileno($ORIGSTDOUT))
-                  or die("IPC::Exe cannot restore STDOUT", "\n  ", $!);
-                select((select(*STDOUT), $| = 1)[0]);
+                open(*STDOUT, ">&=", $ORIGSTDOUT)
+                  or croak("IPC::Exe cannot restore STDOUT", "\n  ", $!);
 
-                open(*STDERR, ">&" . fileno($ORIGSTDERR))
-                  or die("IPC::Exe cannot restore STDERR", "\n  ", $!);
-                select((select(*STDERR), $| = 1)[0]);
+                open(*STDERR, ">&=", $ORIGSTDERR)
+                  or croak("IPC::Exe cannot restore STDERR", "\n  ", $!);
             }
             else
             {
@@ -685,9 +772,8 @@ sub _pipe_from_fork ($$) {
                 close($READY);
 
                 # file descriptors are not "process"-persistent on Win32
-                open(*STDOUT, ">&" . fileno($WRITE))
-                  or die("IPC::Exe cannot establish IPC after fork", "\n  ", $!);
-                select((select(*STDOUT), $| = 1)[0]);
+                open(*STDOUT, ">&=", $WRITE)
+                  or croak("IPC::Exe cannot establish IPC after fork", "\n  ", $!);
             }
         }
     }
@@ -763,7 +849,7 @@ Extending the previous example,
 
 can be replaced with
 
-  my $exit = &{ exe sub { open(STDOUT, '>', 'out.txt') or die $! }, 'myprog', $arg1, $arg2, };
+  my $exit = &{ exe sub { [ '>', 'out.txt' ] }, 'myprog', $arg1, $arg2, };
 
 The previous two examples will wait for 'myprog' to finish executing before continuing the main program.
 
@@ -775,7 +861,7 @@ Extending the previous example again,
 can be replaced with
 
   # just add 'bg' before 'exe' in previous example
-  my $bg_pid = &{ bg exe sub { open(STDOUT, '>', 'out.txt') or die $! }, 'myprog', $arg1, $arg2, };
+  my $bg_pid = &{ bg exe sub { [ '>', 'out.txt' ] }, 'myprog', $arg1, $arg2, };
 
 Now, 'myprog' will be put in background and the main program will continue without waiting.
 
@@ -785,7 +871,7 @@ To monitor the exit value of a background process:
       bg sub {
              # same as 2nd previous example
              my ($pid) = &{
-                 exe sub { open(STDOUT, '>', 'out.txt') or die $! }, 'myprog', $arg1, $arg2,
+                 exe sub { [ '>', 'out.txt' ] }, 'myprog', $arg1, $arg2,
              };
 
              # check if exe() was successful
@@ -907,7 +993,7 @@ Shown below is an example of how to capture C<STDERR> and C<STDOUT> after sendin
   # reap child processes 'xargs' when done
   local $SIG{CHLD} = 'IGNORE';
 
-  # like IPC::Open3, except filehandles are generated on-the-fly
+  # like IPC::Open3, filehandles are generated on-the-fly
   my ($pid, $TO_STDIN, $FROM_STDOUT, $FROM_STDERR) = &{
       exe +{ stdin => 1, stdout => 1, stderr => 1 }, qw(xargs ls -ld),
   };
@@ -979,17 +1065,29 @@ C<LIST> is C<exec( )> in the child process after the parent is forked, where the
 
 C<&PREEXEC> is called right before C<exec( )> in the child process, so we may reopen filehandles or do some child-only operations beforehand.
 
-Optionally, C<&PREEXEC> could return a LIST of strings to perform common filehandle redirections and/or C<binmode> settings. The following are preset actions:
+Optionally, C<&PREEXEC> could return a LIST of strings to perform common filehandle redirections and/or modify C<binmode> settings (which are performed in-order). The following are preset actions:
 
   "2>#"  or "2>null"   silence  stderr
    ">#"  or "1>null"   silence  stdout
   "2>&1"               redirect stderr to  stdout
   "1>&2" or ">&2"      redirect stdout to  stderr
-  "1><2"               swap     stdout and stderr
+  "1><2" or "2><1"     swap     stdout and stderr
 
-  "0:crlf"             does binmode(STDIN,  ":crlf");
-  "1:raw" or "1:"      does binmode(STDOUT, ":raw");
-  "2:utf8"             does binmode(STDERR, ":utf8");
+  "0:crlf"             does binmode(STDIN,  ":crlf")
+  "1:raw" or "1:"      does binmode(STDOUT, ":raw")
+  "2:utf8"             does binmode(STDERR, ":utf8")
+
+C<&PREEXEC> could also return array references in the mix to perform C<open> operations. If C<open> fails, C<IPC::Exe> will die. Minimal validation is done for the array items, so be careful. Examples:
+
+  [ ">",  "/path/file" ]   does open(STDOUT, ">",  "/path/file")
+  [ ">>", "/path/file" ]   does open(STDOUT, ">>", "/path/file")
+  [ "2>", "/path/file" ]   does open(STDERR, ">",  "/path/file")
+  [ *FH, "+>>", $file ]    does open(FH, "+>>", $file)
+
+If references to array refs are returned by C<&PREEXEC>, then C<sysopen> will be used instead:
+
+  \[ *FH, $file, O_RDWR ]           does sysopen(FH, $file, O_RDWR)
+  \[ *FH, $file, O_WRONLY, 0644 ]   does sysopen(FH, $file, O_WRONLY, 0644)
 
 It is important to note that the actions & return of C<&PREEXEC> matters, as it may be used to redirect filehandles before C<&PREEXEC> becomes the exec process.
 
@@ -1049,11 +1147,12 @@ Upon failure of background to init process, C<bg( )> can fallback by calling C<&
 
 =head2 exe( )
 
-C<\%EXE_OPTIONS> is a hash reference that can be provided as the first argument to C<exe( )> to control returned values. It may be used to return C<STDIN> / C<STDERR> / C<STDOUT> filehandle(s) of the child process to emulate L<IPC::Open2> and L<IPC::Open3> behavior.
+C<\%EXE_OPTIONS> is a hash reference that can be provided as the first argument to C<exe( )> to control returned values. It may be used to return or assign C<STDIN> / C<STDERR> / C<STDOUT> filehandle(s) of the child process to emulate L<IPC::Open2> and L<IPC::Open3> behavior.
 
 The default values are:
 
   %EXE_OPTIONS = (
+      pid         => undef,
       stdin       => 0,
       stdout      => 0,
       stderr      => 0,
@@ -1065,17 +1164,27 @@ These are the effects of setting the following options:
 
 =over
 
-=item stdin => 1
+=item pid => \$pid
+
+Set C<$pid> to the child process PID, given a SCALAR reference. The PID will not be returned as part of the return values of C<exe( )>.
+
+=item stdin => 1  or  stdin => \$TO_STDIN
 
 Return a B<WRITEHANDLE> to C<STDIN> of the child process. The filehandle will be set to autoflush on write if C<$EXE_OPTIONS{autoflush}> is true.
 
-=item stdout => 1
+If given a SCALAR reference, set C<$TO_STDIN> to the B<WRITEHANDLE> described above. The WRITEHANDLE then will not be returned as part of the return values of C<exe( )>.
+
+=item stdout => 1  or  stdout => \$FROM_STDOUT
 
 Return a B<READHANDLE> from C<STDOUT> of the child process, so output to stdout may be captured. When this option is set and C<&READER> is not provided, the default C<&READER> subroutine will B<NOT> be called.
 
-=item stderr => 1
+If given a SCALAR reference, set C<$FROM_STDOUT> to the B<READHANDLE> described above. The READHANDLE then will not be returned as part of the return values of C<exe( )>.
+
+=item stderr => 1  or  stdout => \$FROM_STDERR
 
 Return a B<READHANDLE> from C<STDERR> of the child process, so output to stderr may be captured.
+
+If given a SCALAR reference, set C<$FROM_STDERR> to the B<READHANDLE> described above. The READHANDLE then will not be returned as part of the return values of C<exe( )>.
 
 =item autoflush => 0
 
@@ -1084,10 +1193,6 @@ Disable autoflush on the B<WRITEHANDLE> to C<STDIN> of the child process. This o
 =item binmode_io => ":raw", ":crlf", ":bytes", ":encoding(utf8)", etc.
 
 Set C<binmode> of C<STDIN> and C<STDOUT> of the child process for layer C<$EXE_OPTIONS{binmode_io}>. This is automatically done for subsequently chained C<exe( )>cutions. To stop this, set to an empty string C<""> or another layer to bring a different mode into effect.
-
-=item exec => 1
-
-This option is deprecated.
 
 =back
 
@@ -1128,7 +1233,7 @@ It returns C<$?>, which is the status of the last pipe process close. This allow
 
 =item *
 
-When non-default C<\%EXE_OPTIONS> are specified, C<exe( )> returns additional filehandles in the following LIST:
+When non-default C<\%EXE_OPTIONS> are specified, each C<exe( )> returns additional filehandles in the following LIST:
 
   (
       $PID,                # undef if exec failed
@@ -1141,6 +1246,14 @@ The positional LIST form return allows code to be written like:
 
   my ($pid, $TO_STDIN, $FROM_STDOUT) = &{
       exe +{ stdin => 1, stdout => 1 }, '/usr/bin/bc'
+  };
+
+SCALAR references may be passed in C<\%EXE_OPTIONS> for their scalars to be assigned in-place, instead of returning them in the positional LIST:
+
+  my ($pid, $FROM_STDOUT);
+  my ($TO_STDIN) = &{
+      exe +{ pid => \$pid, stdin => 1, stdout => \$FROM_STDOUT },
+        '/usr/bin/bc'
   };
 
 B<Note:> It is necessary to disambiguate C<\%EXE_OPTIONS> (also C<\%BG_OPTIONS>) as a hash reference by including a unary C<+> before the opening curly bracket:
@@ -1166,6 +1279,17 @@ B<WARNING:> This may get a slightly complicated for chained C<exe( )>'s when non
 A minimum count of items (PIDs and/or filehandles) can be expected in the returned LIST to determine whether forks were initiated for the entire C<exe( )> / C<bg( )> chain.
 
 Failures after forking are responded with C<die( )>. To handle these errors, use C<eval>.
+
+
+=head1 TAINT CHECKING
+
+In taint mode, C<exe( )> will die if it is called with tainted arguments or environment variables. By default, the following environment variables are checked:
+
+  PATH  PATHEXT  IFS  CDPATH  ENV  BASH_ENV  PERL5SHELL
+
+We may add to this list with:
+
+  BEGIN { push @IPC::Exe::TAINT_ENV, qw(PATH_LOCALE TERMINFO TERMPATH) }
 
 
 =head1 SYNTAX
@@ -1261,7 +1385,7 @@ The way to ensure C<exe( )> works smoothly on Win32 is to C<exec> processes on t
 
 Now, C<&PREEXEC> is no longer running in the same process, and cannot affect C<&READER>. If the new C<perl> process blocks, C<&READER> in the original process can still continue to read the pipe.
 
-Writing and reading small amounts of data (to not cause blocking) between C<&PREEXEC> and C<&READER> is possible, but not recommended. Experimentation shows that the pipe buffer size is 488 bytes.
+Writing and reading small amounts of data (to not cause blocking) between C<&PREEXEC> and C<&READER> is possible, but not recommended.
 
 =head3 bg( )
 
@@ -1305,29 +1429,7 @@ Some useful information:
 
 Perl v5.6.0+ is required.
 
-The following modules are required:
-
-=over
-
-=item *
-
-L<Exporter> [core module]
-
-=item *
-
-L<File::Spec> [core module]
-
-=back
-
-Extra module required for non-Unix platforms:
-
-=over
-
-=item *
-
-L<Time::HiRes> [core module]
-
-=back
+No non-core modules are required.
 
 
 =head1 AUTHOR

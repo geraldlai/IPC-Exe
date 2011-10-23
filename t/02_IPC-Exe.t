@@ -1,11 +1,11 @@
 use warnings;
 use strict;
 
+my $DEBUG = 0;
+
 use Test::More;
 use Scalar::Util qw(refaddr);
 use Data::Dumper;
-
-eval "use Time::HiRes qw(alarm)";
 
 BEGIN {
     # need 5.6+ for lexical filehandles
@@ -22,9 +22,7 @@ BEGIN {
     }
 }
 
-my $DEBUG = 0;
-
-BEGIN { plan tests => 80 }
+BEGIN { plan tests => 83 }
 #BEGIN { plan "no_plan" }
 
 # can we use the module?
@@ -32,6 +30,7 @@ use lib "../lib";
 BEGIN { use_ok("IPC::Exe", qw(exe bg)); }
 
 # timeout handling
+eval "use Time::HiRes qw(alarm)";
 sub timeout (&@) {
     my $cb = shift();
     my $test_name = shift();
@@ -104,7 +103,7 @@ my $filt_err_out = [
 
 # exit status
 {
-    ($?, $!, $^E) = (55, 66, 66);
+    ($?, $!, $^E, $@) = (55, 66, 66, "e");
 
     my @pids1 = &{
         exe sub { "1>#" }, @{ $gen_out->[0] },
@@ -114,6 +113,7 @@ my $filt_err_out = [
     is($?        >> 8, 44,  "exit: gen_out exit status \$?");
     is($!  + 0       , 66,  "exit: gen_out exit status \$!");
     is($^E + 0       , 66,  "exit: gen_out exit status \$^E");
+    is($@            , "e", "exit: gen_out exit status \$@");
     is($pids1[1] >> 8, 44,  "exit: gen_out exit status return");
 
     my @pids2 = &{
@@ -123,7 +123,8 @@ my $filt_err_out = [
     ok( defined($pids2[0]), "exit: gen_err pid");
     is($?        >> 8, 77,  "exit: gen_err exit status \$?");
     is($!  + 0       , 66,  "exit: gen_err exit status \$!");
-    is($^E + 0       , 66,  "exit: gen_out exit status \$^E");
+    is($^E + 0       , 66,  "exit: gen_err exit status \$^E");
+    is($@            , "e", "exit: gen_err exit status \$@");
     is($pids2[1] >> 8, 77,  "exit: gen_err exit status return");
 
     my @pids3 = &{
@@ -132,6 +133,7 @@ my $filt_err_out = [
             # avoid implicit close() that clobbers $! / $^E
             close($IPC::Exe::PIPE);
 
+            $@ = "k";
             $! = $^E = 33;
             $? = $! << 8;
         }
@@ -141,6 +143,7 @@ my $filt_err_out = [
     is($?        >> 8, 33,  "exit_fake: exit status \$?");
     is($!  + 0       , 33,  "exit_fake: exit status \$!");
     is($^E + 0       , 33,  "exit_fake: exit status \$^E");
+    is($@            , "k", "exit_fake: exit status \$@");
     is($pids3[1] >> 8, 33,  "exit_fake: exit status return");
 
     my @pids4 = &{
@@ -329,8 +332,8 @@ SKIP: {
 # redirect STDERR to STDOUT with filters
 {
     my @pids = &{
-        exe sub { "2>&1" }, @{ $gen_err->[0] },
-        exe sub { "2>&1" }, @{ $filt_err_1->[0] },
+        exe sub { [ *STDERR, ">&" . fileno(*STDOUT) ] }, @{ $gen_err->[0] },
+        exe sub { [         "2>&" . fileno(*STDOUT) ] }, @{ $filt_err_1->[0] },
         exe @{ $filt_out_2->[0] },
         sub {
             timeout {
@@ -628,8 +631,10 @@ SKIP: {
 {
     local $SIG{CHLD} = 'IGNORE';
 
-    my ($pid, $TO_STDIN, $FROM_STDERR) = &{
-        exe +{ stdin => 1, stderr => 1 }, @{ $filt_err_1->[0] },
+    my ($pid, $FROM_STDERR);
+    my ($TO_STDIN) = &{
+        exe +{ pid => \$pid, stdin => 1, stderr => \$FROM_STDERR },
+          @{ $filt_err_1->[0] },
         sub { }, # avoid using default &READER
     };
 
