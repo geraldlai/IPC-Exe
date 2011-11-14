@@ -5,14 +5,11 @@ use 5.008_008;
 use warnings;
 use strict;
 
-# XXX: be quiet about "Attempt to free unreferenced scalar" on Win32
-no warnings qw(internal);
-
 BEGIN {
     require Exporter;
     *import = \&Exporter::import;
 
-    our $VERSION   = "2.001001";
+    our $VERSION   = "2.002001";
     our @EXPORT_OK = qw(exe bg);
 }
 
@@ -20,11 +17,13 @@ use Carp qw(carp croak);
 use Data::Dumper qw(Dumper);
 use File::Spec ();
 use Scalar::Util qw(tainted);
+use Symbol qw(gensym);
 use Time::HiRes qw(usleep);
 
 ++$Carp::Internal{$_} for __PACKAGE__;
 
 use constant NON_UNIX => ($^O =~ /^(?:MSWin32|os2)$/);
+use constant OPEN_RDWR_RX => qr/^\s*(\d*)\s*(\+?[<>].*)/;
 
 # default environment variables to check for taint
 our @TAINT_ENV = qw(PATH PATHEXT IFS CDPATH ENV BASH_ENV PERL5SHELL);
@@ -94,6 +93,18 @@ sub _check_taint {
     }
 
     return;
+}
+
+sub _fh_slot {
+    my ($slots, $n) = @_;
+    $n += 0;
+
+    my $FH_name = qw(STDIN STDOUT STDERR)[$n] || "FH[$n]";
+    my $FH = ($n <= 2)
+      ? (\*STDIN, \*STDOUT, \*STDERR)[$n]
+      : ($slots->[$n] ||= gensym());
+
+    return ($FH, $FH_name);
 }
 
 sub exe {
@@ -167,6 +178,21 @@ sub _exe {
     $Preexec = shift if _reftype($_[0])  eq "CODE";
     $Reader  =   pop if _reftype($_[-1]) eq "CODE";
 
+    # obtain redirects
+    my @redirs;
+    unshift(@redirs, pop) while ref($_[-1]);
+    if (@redirs)
+    {
+        my $old_preexec;
+        $old_preexec = $Preexec if $Preexec;
+
+        $Preexec = sub {
+            my @FHops;
+            @FHops = $old_preexec->(@_) if $old_preexec;
+            return (@FHops, @redirs);
+        };
+    }
+
     # what is left is the command LIST
     my @cmd_list = @_;
 
@@ -204,7 +230,7 @@ sub _exe {
     if ($gotchild)
     {
         # unneeded stuff
-        undef $_ for $Preexec, $_args;
+        undef $_ for $Preexec, $_args, @redirs;
         close($FOR_STDIN) if $FOR_STDIN;
         close($BY_STDERR) if $BY_STDERR;
 
@@ -226,42 +252,49 @@ IPC::Exe::exe() cannot set binmode STDOUT_READHANDLE for layer "$layer"
 EOT
         }
 
-        # temporarily replace stdin
-        $IPC::Exe::_stdin
-          ? open(*STDIN, "<&=", $EXE_READ)
-          : open(*STDIN, "<&",  $EXE_READ)
-              or croak("IPC::Exe::exe() cannot replace STDIN", "\n  ", $!);
-
-        # create local package-scope $IPC::Exe::PIPE
-        local our $PIPE = $EXE_READ;
-
         my (@ret, @status_reader);
 
-        # call READER subroutine
         if ($Reader)
         {
             # non-Unix: reset to default $IPC::Exe::_preexec_wait time
             local $IPC::Exe::_preexec_wait;
 
-            { @ret = $Reader->($gotchild, @cmd_list) }
+            # temporarily replace stdin
+            $IPC::Exe::_stdin
+              ? open(*STDIN, "<&=", $EXE_READ)
+              : open(*STDIN, "<&",  $EXE_READ)
+                  or croak("IPC::Exe::exe() cannot replace STDIN", "\n  ", $!);
 
-            @status_reader = ($?, -+-$!, -+-$^E, $@);
-            undef $PIPE;
+            # create local package-scope $IPC::Exe::PIPE
+            local our $PIPE = $EXE_READ;
+
+            ($?, $!, $^E, my $err) = @status;
+
+            my $failed = ! eval {
+                $@ = $err;
+                @ret = $Reader->($gotchild, @cmd_list);
+                $err = $@;
+                1;
+            };
+
+            @status_reader = ($?, -+-$!, -+-$^E, $failed ? $@ : $err);
+
+            # restore stdin
+            NON_UNIX
+              ? open(*STDIN, "<&=", $ORIGSTDIN)
+              : open(*STDIN, "<&",  $ORIGSTDIN)
+              or croak("IPC::Exe::exe() cannot restore STDIN", "\n  ", $!);
+
+            die $status_reader[3] if $failed;
         }
         elsif (!$opt{stdout})
         {
-            # default READER just prints stdin
+            # default &READER just prints stdin
             while (my $read = <$EXE_READ>)
             {
                 print $read;
             }
         }
-
-        # restore stdin
-        NON_UNIX
-          ? open(*STDIN, "<&=", $ORIGSTDIN)
-          : open(*STDIN, "<&",  $ORIGSTDIN)
-          or croak("IPC::Exe::exe() cannot restore STDIN", "\n  ", $!);
 
         # do not wait for interactive children
         my $reap = 0;
@@ -366,11 +399,12 @@ EOT
         }
 
         # call PREEXEC subroutine if defined
-        my @FHop;
+        my @FHops;
         if ($Preexec)
         {
-            { @FHop = $Preexec->($_args ? @{ $_args } : ()) }
-            undef $_ for $Preexec, $_args;
+            local ($?, $!, $^E, $@) = @status;
+            @FHops = $Preexec->($_args ? @{ $_args } : ());
+            undef $_ for $Preexec, $_args, @redirs;
         }
 
         # manually flush STDERR and STDOUT
@@ -391,44 +425,46 @@ EOT
         }
 
         # perform redirections
-        for (@FHop)
+        my @FHs;
+        for (@FHops)
         {
-            next unless defined($_);
-
             if (ref($_))
             {
                 my $is_sysopen = 0;
-                $_ = ${ $_ } and ++$is_sysopen
-                  if _reftype($_) eq "REF";
+
+                if (_reftype($_) =~ /REF|SCALAR/)
+                {
+                    $_ = ${ $_ };
+                    ++$is_sysopen;
+                }
 
                 # open / sysopen
                 if (_reftype($_) eq "ARRAY")
                 {
                     my @args = @{ $_ };
-                    my ($fh_name, $fh_num, $op);
+                    my $FH_name;
 
-                    unless ($is_sysopen)
+                    if (!$is_sysopen && defined($args[0]))
                     {
-                        ($fh_num, $op) = ($args[0] =~ /^([012]?)(\+?[<>].*)/)
-                          if defined($args[0]);
+                        my ($src, $op) = ($args[0] =~ OPEN_RDWR_RX);
 
                         if (defined($op))
                         {
-                            $fh_num = index($op, ">") == -1 ? 0
-                              : !$fh_num ? 1
-                              : $fh_num + 0;
-                            $fh_name = qw(STDIN STDOUT STDERR)[$fh_num];
+                            $src = (index($op, "<") == -1) ? 1 : 0
+                              if $src eq "";
+
+                            (my $FH, $FH_name) = _fh_slot(\@FHs, $src);
                             shift @args;
-                            unshift @args, (*STDIN, *STDOUT, *STDERR)[$fh_num], $op;
+                            unshift @args, ($FH, $op);
                         }
                     }
 
                     my $error_msg =
-                      "IPC::Exe::exe() failed to "
+                      "IPC::Exe::exe() failed "
                       . ($is_sysopen ? "sysopen" : "open") . "( "
-                      . ($fh_name ? "$fh_name, " : "")
+                      . ($FH_name ? "$FH_name, " : "")
                       . _stringify_args(
-                          $fh_name ? () : $args[0],
+                          $FH_name ? () : $args[0],
                           @args[1 .. $#args],
                       ) . " )";
 
@@ -449,68 +485,103 @@ EOT
                             @args[3 .. $#args],
                         )
                           or croak($error_msg, "\n  ", $!);
+
+                    next;
                 }
-
-                next;
             }
 
-            # silence stderr
-            /^\s*2>\s*(?:null|#)\s*$/  and open(*STDERR, ">", $DEVNULL)
-            || croak(<<"EOT", "  ", $!);
-IPC::Exe::exe() cannot silence STDERR (does $DEVNULL exist?)
-EOT
-
-            # silence stdout
-            /^\s*1?>\s*(?:null|#)\s*$/ and open(*STDOUT, ">", $DEVNULL)
-            || croak(<<"EOT", "  ", $!);
-IPC::Exe::exe() cannot silence STDOUT (does $DEVNULL exist?)
-EOT
-
-            # redirect stderr to stdout
-            /^\s*2>&\s*1\s*$/          and open(*STDERR, ">&STDOUT")
-            || croak(<<"EOT", "  ", $!);
-IPC::Exe::exe() cannot redirect STDERR to STDOUT
-EOT
-
-            # redirect stdout to stderr
-            /^\s*1?>&\s*2\s*$/         and open(*STDOUT, ">&STDERR")
-            || croak(<<"EOT", "  ", $!);
-IPC::Exe::exe() cannot redirect STDOUT to STDERR
-EOT
-
-            # swap stdout and stderr
-            if (/^\s*(?:1><2|2><1)\s*$/)
-            {
-                my $SWAP;
-                open($SWAP, ">&STDOUT")
-                  and open(*STDOUT, ">&STDERR")
-                  and open(*STDERR, ">&=", $SWAP)
-                  or croak(<<"EOT", "  ", $!);
-IPC::Exe::exe() cannot swap STDOUT and STDERR
-EOT
-            }
+            next unless defined($_);
 
             # set binmode
-            if (/^\s*([012])(:.*)$/)
+            if (/^\s*([012])\s*(:.*)$/)
             {
-                my $fh_name = qw(STDIN STDOUT STDERR)[$1];
+                my $FH_name = qw(STDIN STDOUT STDERR)[$1];
                 my $layer = $2;
                 $layer = ":raw" if $layer eq ":";
 
                 binmode((*STDIN, *STDOUT, *STDERR)[$1], $layer)
                   or croak(<<"EOT", "  ", $!);
-IPC::Exe::exe() cannot set binmode $fh_name for layer "$layer"
+IPC::Exe::exe() cannot set binmode $FH_name for layer "$layer"
 EOT
+                next;
+            }
+
+            # silence filehandles
+            if (/^\s*(\d*)\s*>\s*(?:null|#)\s*$/)
+            {
+                my $src = ($1 eq "") ? 1 : $1;
+                my ($FH, $FH_name) = _fh_slot(\@FHs, $src);
+
+                open($FH, ">", $DEVNULL)
+                  or croak(<<"EOT", "  ", $!);
+IPC::Exe::exe() cannot silence $FH_name (does $DEVNULL exist?)
+EOT
+                next;
+            }
+
+            # swap filehandles
+            if (/^\s*(\d+)\s*><\s*(\d+)\s*$/)
+            {
+                my ($FH1, $FH_name1) = _fh_slot(\@FHs, $1);
+                my ($FH2, $FH_name2) = _fh_slot(\@FHs, $2);
+
+                my $SWAP;
+                local $! = 9;
+                _is_fh($FH1) && _is_fh($FH2)
+                  && open($SWAP, ">&", $FH1)
+                  && open($FH1, ">&", $FH2)
+                  && open($FH2, ">&=", $SWAP)
+                  or croak(<<"EOT", "  ", $!);
+IPC::Exe::exe() cannot swap $FH_name1 and $FH_name2
+EOT
+                next;
+            }
+
+            # redirect/close filehandles
+            my ($src, $op, $tgt) =
+              /^\s*(\d*)\s*(\+?(?:<|>>?)&=?)\s*(\d+|-)\s*$/;
+
+            if (defined($op))
+            {
+                $src = (index($op, "<") == -1) ? 1 : 0
+                  if $src eq "";
+
+                my ($FH1, $FH_name1) = _fh_slot(\@FHs, $src);
+
+                if ($tgt eq "-")
+                {
+                    close($FH1) or croak(<<"EOT", "  ", $!);
+IPC::Exe::exe() failed to close $FH_name1
+EOT
+                    next;
+                }
+
+                my ($FH2, $FH_name2) = _fh_slot(\@FHs, $tgt);
+
+                local $! = 9;
+                _is_fh($FH2) && open($FH1, $op, $FH2)
+                  or croak(<<"EOT", "  ", $!);
+IPC::Exe::exe() failed redirect $FH_name1 $op $FH_name2
+EOT
+                next;
+            }
+
+            if ($_ =~ OPEN_RDWR_RX)
+            {
+                $_ = [ $_ ];
+                redo;
             }
         }
-
-        no warnings qw(exec);
 
         # non-Unix: escape command so that it feels Unix-like
         my @cmd = _escape_cmd_list(@cmd_list);
 
         # non-Unix: signal parent "process" to restore filehandles
         my $restore_fh = (NON_UNIX && _is_fh($EXE_GO));
+
+        no warnings qw(exec);
+        # XXX: be quiet about "Attempt to free unreferenced scalar" for Win32
+        no warnings qw(internal);
 
         # assume exit status 255 indicates failed exec
         ($restore_fh ? print $EXE_GO "exe_with_exec\n" : 1)
@@ -528,7 +599,8 @@ sub bg {
     return sub { _bg(@_ ? [ @_ ] : undef, @{ $args }) };
 }
 sub _bg {
-    # localize error variables
+    # record error variables
+    my @status = ($?, -+-$!, -+-$^E, $@);
     local ($?, $!, $^E, $@);
 
     # ref to arguments passed to closure
@@ -679,7 +751,8 @@ EOT
             }
 
             # BACKGROUND subroutine does not need to return
-            { $Background->($_args ? @{ $_args } : ()) }
+            ($?, $!, $^E, $@) = @status;
+            $Background->($_args ? @{ $_args } : ());
             undef $_ for $Background, $_args;
         }
         elsif (!$defined_child)
@@ -803,7 +876,7 @@ IPC::Exe - Execute processes or Perl subroutines & string them via IPC. Think sh
   use IPC::Exe qw(exe bg);
 
   my @pids = &{
-         exe sub { "2>#" }, qw( ls  /tmp  a.txt ),
+         exe qw( ls  /tmp  a.txt ), \"2>#",
       bg exe qw( sort -r ),
          exe sub { print "[", shift, "] 2nd cmd: @_\n"; print "three> $_" while <STDIN> },
       bg exe 'sort',
@@ -849,7 +922,7 @@ Extending the previous example,
 
 can be replaced with
 
-  my $exit = &{ exe sub { [ '>', 'out.txt' ] }, 'myprog', $arg1, $arg2, };
+  my $exit = &{ exe 'myprog', $arg1, $arg2, [ '>', 'out.txt' ] };
 
 The previous two examples will wait for 'myprog' to finish executing before continuing the main program.
 
@@ -861,7 +934,7 @@ Extending the previous example again,
 can be replaced with
 
   # just add 'bg' before 'exe' in previous example
-  my $bg_pid = &{ bg exe sub { [ '>', 'out.txt' ] }, 'myprog', $arg1, $arg2, };
+  my $bg_pid = &{ bg exe 'myprog', $arg1, $arg2, [ '>', 'out.txt' ] };
 
 Now, 'myprog' will be put in background and the main program will continue without waiting.
 
@@ -871,24 +944,21 @@ To monitor the exit value of a background process:
       bg sub {
              # same as 2nd previous example
              my ($pid) = &{
-                 exe sub { [ '>', 'out.txt' ] }, 'myprog', $arg1, $arg2,
+                 exe 'myprog', $arg1, $arg2, [ '>', 'out.txt' ]
              };
 
              # check if exe() was successful
-             defined($pid) or die("Failed to fork process in background");
+             defined($pid) or die("Failed to run process in background");
 
              # handle exit value here
              print STDERR "background exit value: " . ($? >> 8) . "\n";
          }
-  };
-
-  # check if bg() was successful
-  defined($bg_pid) or die("Failed to send process to background");
+  } or die("Failed to send process to background");
 
 Instead of using backquotes or C<qx( )>,
 
   # slurps entire STDOUT into memory
-  my @stdout = (`$program @ARGV`);
+  my @stdout = `$program @ARGV`;
 
   # handle STDOUT here
   for my $line (@stdout)
@@ -915,7 +985,7 @@ we can read the C<STDOUT> of one process with:
   };
 
   # check if exe() was successful
-  defined($pid) or die("Failed to fork process");
+  defined($pid) or die("Failed to run process");
 
   # exit value of $program
   my $exitval = $? >> 8;
@@ -931,7 +1001,7 @@ Perform tar copy of an entire directory:
 
   # check if exe()'s were successful
   defined($pids[0]) && defined($pids[1])
-    or die("Failed to fork processes");
+    or die("Failed to run processes");
 
   # was un-tar successful?
   my $error = pop(@pids);
@@ -940,7 +1010,7 @@ Here is an elaborate example to pipe C<STDOUT> of one process to the C<STDIN> of
 
   my @pids = &{
       # redirect STDERR to STDOUT
-      exe sub { "2>&1" }, $program, @ARGV,
+      exe $program, @ARGV, \"2>&1",
 
       # 'perl' receives STDOUT of $program via STDIN
       exe sub {
@@ -949,7 +1019,7 @@ Here is an elaborate example to pipe C<STDOUT> of one process to the C<STDIN> of
               };
 
               # check if exe() was successful
-              defined($pid) or die("Failed to fork process");
+              defined($pid) or die("Failed to run process");
 
               # handle exit value here
               print STDERR "in-between exit value: " . ($? >> 8) . "\n";
@@ -983,7 +1053,7 @@ Here is an elaborate example to pipe C<STDOUT> of one process to the C<STDIN> of
 
   # check if exe()'s were successful
   defined($pids[0]) && defined($pids[1]) && defined($pids[2])
-    or die("Failed to fork processes");
+    or die("Failed to run processes");
 
   # obtain exit value of last process on pipeline
   my $exitval = pop(@pids) >> 8;
@@ -993,13 +1063,13 @@ Shown below is an example of how to capture C<STDERR> and C<STDOUT> after sendin
   # reap child processes 'xargs' when done
   local $SIG{CHLD} = 'IGNORE';
 
-  # like IPC::Open3, filehandles are generated on-the-fly
+  # like IPC::Open3; filehandles are returned on-the-fly
   my ($pid, $TO_STDIN, $FROM_STDOUT, $FROM_STDERR) = &{
       exe +{ stdin => 1, stdout => 1, stderr => 1 }, qw(xargs ls -ld),
   };
 
   # check if exe() was successful
-  defined($pid) or die("Failed to fork process");
+  defined($pid) or die("Failed to run process");
 
   # ask 'xargs' to 'ls -ld' three files
   print $TO_STDIN "/bin\n";
@@ -1022,7 +1092,7 @@ Of course, more C<exe( )> calls may be chained together as needed:
   # reap child processes 'xargs' when done
   local $SIG{CHLD} = 'IGNORE';
 
-  # like IPC::Open2, except filehandles are generated on-the-fly
+  # like IPC::Open2; filehandles are returned on-the-fly
   my ($pid1, $TO_STDIN, $pid2, $FROM_STDOUT) = &{
       exe +{ stdin  => 1 }, sub { "2>&1" }, qw(perl -ne), 'print STDERR "360.0 / $_"',
       exe +{ stdout => 1 }, qw(bc -l),
@@ -1030,7 +1100,7 @@ Of course, more C<exe( )> calls may be chained together as needed:
 
   # check if exe()'s were successful
   defined($pid1) && defined($pid2)
-    or die("Failed to fork processes");
+    or die("Failed to run processes");
 
   # ask 'bc -l' results of "360 divided by given inputs"
   print $TO_STDIN "$_\n" for 2 .. 8;
@@ -1054,24 +1124,24 @@ Both C<exe( )> and C<bg( )> are optionally exported. They each return CODE refer
 
 =head2 exe( )
 
-  exe \%EXE_OPTIONS, &PREEXEC, LIST, &READER
-  exe \%EXE_OPTIONS, &PREEXEC, &READER
-  exe \%EXE_OPTIONS, &PREEXEC
-  exe &READER
+  exe \%EXE_OPTIONS, &PREEXEC, LIST, @REDIRECTS, &READER
 
 C<\%EXE_OPTIONS> is an optional hash reference to instruct C<exe( )> to return C<STDIN> / C<STDERR> / C<STDOUT> filehandle(s) of the executed B<child> process. See L</SETTING OPTIONS>.
 
-C<LIST> is C<exec( )> in the child process after the parent is forked, where the child's stdout is redirected to C<&READER>'s stdin.
+C<LIST> is C<exec( )> in the child process after the parent is forked, where the child's stdout is redirected to C<&READER>'s stdin. It is optional if C<&PREEXEC> is provided.
 
-C<&PREEXEC> is called right before C<exec( )> in the child process, so we may reopen filehandles or do some child-only operations beforehand.
+C<&PREEXEC> is called right before C<exec( )> in the child process, so we may reopen filehandles or do some child-only operations beforehand. It is optional if C<LIST> is provided.
 
-Optionally, C<&PREEXEC> could return a LIST of strings to perform common filehandle redirections and/or modify C<binmode> settings (which are performed in-order). The following are preset actions:
+C<&PREEXEC> could return a LIST of C<@REDIRECTS> to perform common filehandle redirections and/or modify C<binmode> settings. The C<@REDIRECTS> may be optionally specified (as references) after C<LIST>. Returning these strings (or references to them) will do the following preset actions:
 
   "2>#"  or "2>null"   silence  stderr
    ">#"  or "1>null"   silence  stdout
   "2>&1"               redirect stderr to  stdout
   "1>&2" or ">&2"      redirect stdout to  stderr
+  "2>&-"               close    stderr
   "1><2" or "2><1"     swap     stdout and stderr
+                       (+) shell-way works too:
+                           \"3>&1", \"1>&2", \"2>&3", \"3>&-"
 
   "0:crlf"             does binmode(STDIN,  ":crlf")
   "1:raw" or "1:"      does binmode(STDOUT, ":raw")
@@ -1089,11 +1159,11 @@ If references to array refs are returned by C<&PREEXEC>, then C<sysopen> will be
   \[ *FH, $file, O_RDWR ]           does sysopen(FH, $file, O_RDWR)
   \[ *FH, $file, O_WRONLY, 0644 ]   does sysopen(FH, $file, O_WRONLY, 0644)
 
-It is important to note that the actions & return of C<&PREEXEC> matters, as it may be used to redirect filehandles before C<&PREEXEC> becomes the exec process.
+It is important to note that the actions & return of C<&PREEXEC> matters, as it may be used to redirect filehandles before C<&PREEXEC> becomes the exec process. If C<@REDIRECTS> are provided along with C<&PREEXEC>, the filehandle operations returned by C<&PREEXEC> are done first prior to C<@REDIRECTS>, in return-order.
 
 C<&PREEXEC> is called with arguments passed to the CODE reference returned by C<exe( )>.
 
-C<&READER> is called with C<($child_pid, LIST)> as its arguments. C<LIST> corresponds to the positional arguments passed in-between C<&PREEXEC> and C<&READER>.
+C<&READER> is called with C<($child_pid, LIST)> as its arguments. C<LIST> corresponds to the positional arguments passed in-between C<&PREEXEC> and C<@REDIRECTS>.
 
 If C<exe( )>'s are chained, C<&READER> calls itself as the next C<exe( )> in line, which in turn, calls the next C<&PREEXEC>, C<LIST>, etc.
 
@@ -1101,26 +1171,23 @@ C<&READER> is always called in the parent process.
 
 C<&PREEXEC> is always called in the child process.
 
-C<&PREEXEC> and C<&READER> are very similar and may be treated the same.
-
 C<waitpid( $_[0], 0 )> in C<&READER> to set exit status C<$?> of previous process executing on the pipe. C<close( $IPC::Exe::PIPE )> can also be used to close the input filehandle and set C<$?> at the same time (for Unix platforms only).
 
 If C<LIST> is not provided, C<&PREEXEC> will still be called.
 
 If C<&PREEXEC> is not provided, C<LIST> will still exec.
 
-If C<&READER> is not provided, it defaults to
+If C<&READER> is not provided, it defaults to something like
 
   sub { print while <STDIN>; waitpid($_[0], 0); return $? } # $_[0] is the $child_pid
 
-C<exe( &READER )> returns C<&READER>.
+C<exe( &READER )> simply returns C<&READER>.
 
 C<exe( )> with no arguments returns an empty list.
 
 =head2 bg( )
 
   bg \%BG_OPTIONS, &BACKGROUND
-  bg &BACKGROUND
 
 C<\%BG_OPTIONS> is an optional hash reference to instruct C<bg( )> to wait a certain amount of time for PREEXEC to complete (for non-Unix platforms only). See L</SETTING OPTIONS>.
 
@@ -1427,7 +1494,7 @@ Some useful information:
 
 =head1 DEPENDENCIES
 
-Perl v5.6.0+ is required.
+Perl v5.8.8+ is required.
 
 No non-core modules are required.
 

@@ -22,7 +22,7 @@ BEGIN {
     }
 }
 
-BEGIN { plan tests => 83 }
+BEGIN { plan tests => 91 }
 #BEGIN { plan "no_plan" }
 
 # can we use the module?
@@ -128,8 +128,14 @@ my $filt_err_out = [
     is($pids2[1] >> 8, 77,  "exit: gen_err exit status return");
 
     my @pids3 = &{
-        exe sub { "1>#" }, @{ $gen_out->[0] },
+        exe @{ $gen_out->[0] }, \"1>#",
         sub {
+            # same as before exe was invoked
+            is($?        >> 8, 77,  "exit_fake_pre: gen_err exit status \$?");
+            is($!  + 0       , 66,  "exit_fake_pre: gen_err exit status \$!");
+            is($^E + 0       , 66,  "exit_fake_pre: gen_err exit status \$^E");
+            is($@            , "e", "exit_fake_pre: gen_err exit status \$@");
+
             # avoid implicit close() that clobbers $! / $^E
             close($IPC::Exe::PIPE);
 
@@ -139,15 +145,15 @@ my $filt_err_out = [
         }
     };
 
-    ok( defined($pids3[0]), "exit_fake: gen_out pid");
-    is($?        >> 8, 33,  "exit_fake: exit status \$?");
-    is($!  + 0       , 33,  "exit_fake: exit status \$!");
-    is($^E + 0       , 33,  "exit_fake: exit status \$^E");
-    is($@            , "k", "exit_fake: exit status \$@");
-    is($pids3[1] >> 8, 33,  "exit_fake: exit status return");
+    ok( defined($pids3[0]), "exit_fake_post: gen_out pid");
+    is($?        >> 8, 33,  "exit_fake_post: exit status \$?");
+    is($!  + 0       , 33,  "exit_fake_post: exit status \$!");
+    is($^E + 0       , 33,  "exit_fake_post: exit status \$^E");
+    is($@            , "k", "exit_fake_post: exit status \$@");
+    is($pids3[1] >> 8, 33,  "exit_fake_post: exit status return");
 
     my @pids4 = &{
-        exe sub { "1>#" }, @{ $gen_out->[0] },
+        exe @{ $gen_out->[0] }, \"1>#",
         sub { $? = 22 << 8; waitpid($_[0], 0); $? }
     };
 
@@ -163,7 +169,7 @@ SKIP: {
     skip("- exit_close_pipe: platform limitation", 3) if $non_unix;
 
     my @pids = &{
-        exe sub { "1>#" }, @{ $gen_out->[0] },
+        exe @{ $gen_out->[0] }, \"1>#",
         sub { $? = 33 << 8; close($IPC::Exe::PIPE); $? }
     };
 
@@ -296,7 +302,7 @@ SKIP: {
 # redirect to null
 {
     my @pids = &{
-        exe sub { ">#" }, @{ $gen_out->[0] },
+        exe @{ $gen_out->[0] }, \">#",
         sub {
             timeout {
                 chomp(my @result = <STDIN>);
@@ -313,7 +319,7 @@ SKIP: {
 # redirect STDERR to STDOUT
 {
     my @pids = &{
-        exe sub { "2>&1" }, @{ $gen_err->[0] },
+        exe @{ $gen_err->[0] }, \"2>&1",
         sub {
             timeout {
                 chomp(my @result = <STDIN>);
@@ -332,8 +338,8 @@ SKIP: {
 # redirect STDERR to STDOUT with filters
 {
     my @pids = &{
-        exe sub { [ *STDERR, ">&" . fileno(*STDOUT) ] }, @{ $gen_err->[0] },
-        exe sub { [         "2>&" . fileno(*STDOUT) ] }, @{ $filt_err_1->[0] },
+        exe @{ $gen_err->[0] }, [ "2>&" . fileno(*STDOUT) ],
+        exe @{ $filt_err_1->[0] }, \"6>&1", \"3>&6", \"2>&3", \"6>&-", \"3>&-",
         exe @{ $filt_out_2->[0] },
         sub {
             timeout {
@@ -383,7 +389,7 @@ SKIP: {
 # bad command with filter
 {
     my @pids = &{
-        exe sub { "2>#" }, "DOES_NOT_EXIST",
+        exe "DOES_NOT_EXIST", \"2>#",
         exe @{ $filt_out_1->[0] },
     };
 
@@ -395,15 +401,27 @@ SKIP: {
 
 # bad filter
 {
-    my @pids = &{
+    my @pids1 = &{
         exe @{ $gen_out->[0] },
-        exe sub { "2>#" }, "DOES_NOT_EXIST",
+        exe "DOES_NOT_EXIST", \"2>#",
     };
 
-    ok( defined($pids[0]), "bad_filter: gen_out pid");
-    ok(!defined($pids[1]), "bad_filter: no filter pid");
+    ok( defined($pids1[0]), "bad_filter: gen_out pid");
+    ok(!defined($pids1[1]), "bad_filter: no filter pid");
 
-    diag Dumper(\@pids) if $DEBUG;
+    my @pids2;
+    local $@;
+    eval {
+        @pids2 = &{
+            exe @{ $gen_out->[0] },
+            sub { die "donkey\n" },
+        };
+    };
+
+    is($@, "donkey\n", "bad_filter: &READER dies \$@");
+    is(scalar(@pids2), 0, "bad_filter: &READER dies no pids");
+
+    diag Dumper(\@pids1, \@pids2) if $DEBUG;
 }
 
 # bad filter sandwich 1
@@ -423,17 +441,30 @@ SKIP: {
 
 # bad filter sandwich 2
 {
-    my @pids = &{
+    my @pids1 = &{
         exe @{ $gen_out->[0] },
         exe @{ $filt_out_1->[0] },
         exe sub { "2>#" }, "DOES_NOT_EXIST",
     };
 
-    ok( defined($pids[0]), "bad_filter_sandwich_2: gen_out pid");
-    ok( defined($pids[1]), "bad_filter_sandwich_2: filt_out_1 pid");
-    ok(!defined($pids[2]), "bad_filter_sandwich_2: no filter pid");
+    ok( defined($pids1[0]), "bad_filter_sandwich_2: gen_out pid");
+    ok( defined($pids1[1]), "bad_filter_sandwich_2: filt_out_1 pid");
+    ok(!defined($pids1[2]), "bad_filter_sandwich_2: no filter pid");
 
-    diag Dumper(\@pids) if $DEBUG;
+    my @pids2;
+    local $@;
+    eval {
+        @pids2 = &{
+            exe @{ $gen_out->[0] },
+            exe @{ $filt_out_1->[0] },
+            sub { die "piglet\n" },
+        };
+    };
+
+    is($@, "piglet\n", "bad_filter_sandwich_2: &READER dies \$@");
+    is(scalar(@pids2), 0, "bad_filter_sandwich_2: &READER dies no pids");
+
+    diag Dumper(\@pids1, \@pids2) if $DEBUG;
 }
 
 # trickle pipe (data smaller than pipe buffer)

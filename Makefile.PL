@@ -16,6 +16,7 @@ WriteMakefile(
         "Data::Dumper" => 0,
         "File::Spec"   => 0,
         "Scalar::Util" => 0,
+        "Symbol"       => 0,
         "Time::HiRes"  => 0,
     },
 );

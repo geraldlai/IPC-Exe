@@ -9,7 +9,7 @@ use Data::Dumper;
 use IPC::Exe qw(exe bg);
                                                                                          
 my @pids = &{
-       exe sub { "2>#" }, qw( ls  /tmp  a.txt ),
+       exe qw( ls  /tmp  a.txt ), \"2>#",
     bg exe qw( sort -r ),
        exe sub { print "[", shift, "] 2nd cmd: @_\n"; print "three> $_" while <STDIN> },
     bg exe 'sort',

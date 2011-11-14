@@ -1,5 +1,13 @@
 Revision history for IPC::Exe
 
+2.002001  2011/11/14
+          + Added syntax sugar: @REDIRECTS can be specified after LIST.
+          + Redirects may be specified with file descriptors > 2. They refer to
+            temporary filehandles that may be used for intermediate redirection.
+            Those filehandles do not necessarily have the same fd fileno.
+          - A &READER that dies will not leave STDIN in a bad state.
+          - Better localization of error variables.
+
 2.001001  2011/10/22
           + Able to pass scalar references to \%EXE_OPTIONS for 'pid', 'stdin',
             'stdout', and 'stderr' options. Each referenced scalar will be
